@@ -1015,9 +1015,18 @@ function SearchPageClient() {
                     <button
                       onClick={() => {
                         setSearchQuery(item);
-                        router.push(
-                          `/search?q=${encodeURIComponent(item.trim())}`
-                        );
+                        setShowResults(true);
+
+                        // 根据当前选项卡执行不同的搜索
+                        if (activeTab === 'video') {
+                          // 影视搜索
+                          router.push(
+                            `/search?q=${encodeURIComponent(item.trim())}`
+                          );
+                        } else if (activeTab === 'pansou') {
+                          // 网盘搜索
+                          setTriggerPansouSearch(prev => !prev);
+                        }
                       }}
                       className='px-4 py-2 bg-gray-500/10 hover:bg-gray-300 rounded-full text-sm text-gray-700 transition-colors duration-200 dark:bg-gray-700/50 dark:hover:bg-gray-600 dark:text-gray-300'
                     >
