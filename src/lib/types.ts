@@ -87,6 +87,8 @@ export interface IStorage {
   ): Promise<void>;
   deleteSkipConfig(userName: string, source: string, id: string): Promise<void>;
   getAllSkipConfigs(userName: string): Promise<{ [key: string]: SkipConfig }>;
+  // 迁移跳过配置
+  migrateSkipConfigs(userName: string): Promise<void>;
 
   // 弹幕过滤配置相关
   getDanmakuFilterConfig(userName: string): Promise<DanmakuFilterConfig | null>;

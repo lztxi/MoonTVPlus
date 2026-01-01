@@ -180,6 +180,7 @@ export class DbManager {
     created_at: number;
     playrecord_migrated?: boolean;
     favorite_migrated?: boolean;
+    skip_migrated?: boolean;
   } | null> {
     if (typeof (this.storage as any).getUserInfoV2 === 'function') {
       return (this.storage as any).getUserInfoV2(userName);
@@ -268,6 +269,13 @@ export class DbManager {
   async migrateFavorites(userName: string): Promise<void> {
     if (typeof (this.storage as any).migrateFavorites === 'function') {
       await (this.storage as any).migrateFavorites(userName);
+    }
+  }
+
+  // ---------- 跳过配置迁移 ----------
+  async migrateSkipConfigs(userName: string): Promise<void> {
+    if (typeof (this.storage as any).migrateSkipConfigs === 'function') {
+      await (this.storage as any).migrateSkipConfigs(userName);
     }
   }
 

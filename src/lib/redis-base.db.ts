@@ -550,7 +550,10 @@ export abstract class BaseRedisStorage implements IStorage {
       await this.withRetry(() => this.client.del(favoriteKeys));
     }
 
-    // 删除跳过片头片尾配置
+    // 删除跳过片头片尾配置（新hash结构）
+    await this.withRetry(() => this.client.del(this.skipHashKey(userName)));
+
+    // 删除旧的跳过配置key（如果有）
     const skipConfigPattern = `u:${userName}:skip:*`;
     const skipConfigKeys = await this.withRetry(() =>
       this.client.keys(skipConfigPattern)
@@ -655,6 +658,7 @@ export abstract class BaseRedisStorage implements IStorage {
     created_at: number;
     playrecord_migrated?: boolean;
     favorite_migrated?: boolean;
+    skip_migrated?: boolean;
   } | null> {
     const userInfo = await this.withRetry(() =>
       this.client.hGetAll(this.userInfoKey(userName))
@@ -673,6 +677,7 @@ export abstract class BaseRedisStorage implements IStorage {
       created_at: parseInt(userInfo.created_at || '0', 10),
       playrecord_migrated: userInfo.playrecord_migrated === 'true',
       favorite_migrated: userInfo.favorite_migrated === 'true',
+      skip_migrated: userInfo.skip_migrated === 'true',
     };
   }
 
@@ -947,8 +952,8 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   // ---------- 跳过片头片尾配置 ----------
-  private skipConfigKey(user: string, source: string, id: string) {
-    return `u:${user}:skip:${source}+${id}`;
+  private skipHashKey(user: string) {
+    return `u:${user}:skip`; // u:username:skip (hash结构)
   }
 
   private danmakuFilterConfigKey(user: string) {
@@ -960,8 +965,9 @@ export abstract class BaseRedisStorage implements IStorage {
     source: string,
     id: string
   ): Promise<SkipConfig | null> {
+    const key = `${source}+${id}`;
     const val = await this.withRetry(() =>
-      this.client.get(this.skipConfigKey(userName, source, id))
+      this.client.hGet(this.skipHashKey(userName), key)
     );
     return val ? (JSON.parse(val) as SkipConfig) : null;
   }
@@ -972,11 +978,9 @@ export abstract class BaseRedisStorage implements IStorage {
     id: string,
     config: SkipConfig
   ): Promise<void> {
+    const key = `${source}+${id}`;
     await this.withRetry(() =>
-      this.client.set(
-        this.skipConfigKey(userName, source, id),
-        JSON.stringify(config)
-      )
+      this.client.hSet(this.skipHashKey(userName), key, JSON.stringify(config))
     );
   }
 
@@ -985,39 +989,100 @@ export abstract class BaseRedisStorage implements IStorage {
     source: string,
     id: string
   ): Promise<void> {
+    const key = `${source}+${id}`;
     await this.withRetry(() =>
-      this.client.del(this.skipConfigKey(userName, source, id))
+      this.client.hDel(this.skipHashKey(userName), key)
     );
   }
 
   async getAllSkipConfigs(
     userName: string
   ): Promise<{ [key: string]: SkipConfig }> {
-    const pattern = `u:${userName}:skip:*`;
-    const keys = await this.withRetry(() => this.client.keys(pattern));
+    const hashData = await this.withRetry(() =>
+      this.client.hGetAll(this.skipHashKey(userName))
+    );
 
-    if (keys.length === 0) {
-      return {};
+    const result: Record<string, SkipConfig> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) {
+        result[key] = JSON.parse(value) as SkipConfig;
+      }
+    }
+    return result;
+  }
+
+  // 迁移跳过配置：从旧的多key结构迁移到新的hash结构
+  async migrateSkipConfigs(userName: string): Promise<void> {
+    const existingMigration = playRecordLocks.get(`${userName}:skip`);
+    if (existingMigration) {
+      console.log(`用户 ${userName} 的跳过配置正在迁移中，等待完成...`);
+      await existingMigration;
+      return;
     }
 
-    const configs: { [key: string]: SkipConfig } = {};
+    const migrationPromise = this.doSkipConfigMigration(userName);
+    playRecordLocks.set(`${userName}:skip`, migrationPromise);
 
-    // 批量获取所有配置
-    const values = await this.withRetry(() => this.client.mGet(keys));
+    try {
+      await migrationPromise;
+    } finally {
+      playRecordLocks.delete(`${userName}:skip`);
+    }
+  }
 
-    keys.forEach((key, index) => {
+  private async doSkipConfigMigration(userName: string): Promise<void> {
+    console.log(`开始迁移用户 ${userName} 的跳过配置...`);
+
+    const userInfo = await this.getUserInfoV2(userName);
+    if (userInfo?.skip_migrated) {
+      console.log(`用户 ${userName} 的跳过配置已经迁移过，跳过`);
+      return;
+    }
+
+    const pattern = `u:${userName}:skip:*`;
+    const oldKeys: string[] = await this.withRetry(() => this.client.keys(pattern));
+
+    if (oldKeys.length === 0) {
+      console.log(`用户 ${userName} 没有旧的跳过配置，标记为已迁移`);
+      await this.withRetry(() =>
+        this.client.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
+      );
+      const { userInfoCache } = await import('./user-cache');
+      userInfoCache?.delete(userName);
+      return;
+    }
+
+    const values = await this.withRetry(() => this.client.mGet(oldKeys));
+
+    const hashData: Record<string, string> = {};
+    oldKeys.forEach((key, index) => {
       const value = values[index];
       if (value) {
-        // 从key中提取source+id
         const match = key.match(/^u:.+?:skip:(.+)$/);
         if (match) {
           const sourceAndId = match[1];
-          configs[sourceAndId] = JSON.parse(value as string) as SkipConfig;
+          hashData[sourceAndId] = value as string;
         }
       }
     });
 
-    return configs;
+    if (Object.keys(hashData).length > 0) {
+      await this.withRetry(() =>
+        this.client.hSet(this.skipHashKey(userName), hashData)
+      );
+      console.log(`成功迁移 ${Object.keys(hashData).length} 条跳过配置到hash结构`);
+    }
+
+    await this.withRetry(() => this.client.del(oldKeys));
+    console.log(`删除了 ${oldKeys.length} 个旧的跳过配置key`);
+
+    await this.withRetry(() =>
+      this.client.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
+    );
+    const { userInfoCache } = await import('./user-cache');
+    userInfoCache?.delete(userName);
+
+    console.log(`用户 ${userName} 的跳过配置迁移完成`);
   }
 
   // ---------- 弹幕过滤配置 ----------

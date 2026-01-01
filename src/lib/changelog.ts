@@ -11,6 +11,17 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: '205.0.1',
+    date: '2026-01-01',
+	added: [
+    ],
+    changed: [
+		"迁移跳过配置到新数据结构"
+    ],
+    fixed: [
+	]
+	},
+	{
     version: '205.0.0',
     date: '2026-01-01',
 	added: [

@@ -338,3 +338,4 @@ async function refreshOpenList() {
     console.error('OpenList 定时扫描失败:', err);
   }
 }
+
