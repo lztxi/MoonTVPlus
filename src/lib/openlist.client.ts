@@ -33,7 +33,7 @@ export interface OpenListGetResponse {
 }
 
 export class OpenListClient {
-  private token: string = '';
+  private token = '';
 
   constructor(
     private baseURL: string,
@@ -158,7 +158,6 @@ export class OpenListClient {
         console.warn('[OpenListClient] 解析响应 JSON 失败:', error);
       }
     }
-
     return response;
   }
 
@@ -166,7 +165,7 @@ export class OpenListClient {
     const token = await this.getToken();
     return {
       Authorization: token, // 不带 bearer
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json'
     };
   }
 
@@ -278,6 +277,31 @@ export class OpenListClient {
     if (!response.ok) {
       throw new Error(`OpenList 删除失败: ${response.status}`);
     }
+  }
+
+  // 获取视频预览流
+  async getVideoPreview(path: string): Promise<any> {
+    const response = await this.fetchWithRetry(`${this.baseURL}/api/fs/other`, {
+      method: 'POST',
+      headers: await this.getHeaders(),
+      body: JSON.stringify({
+        path: path,
+        method: 'video_preview',
+        password: '',
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`视频预览请求失败: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.code !== 200) {
+      throw new Error(`视频预览失败: ${data.message}`);
+    }
+
+    return data;
   }
 
   // 检查连通性
