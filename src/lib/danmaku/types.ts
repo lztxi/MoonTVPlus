@@ -52,11 +52,12 @@ export interface DanmakuSettings {
   fontSize: number; // 字体大小
   speed: number; // 弹幕速度 (5-20)
   marginTop: number; // 顶部边距
-  marginBottom: number; // 底部边距
+  marginBottom: number | string; // 底部边距（数字或百分比字符串如"50%"）
   maxlength: number; // 最大弹幕数
   filterRules: string[]; // 过滤规则（正则表达式）
   unlimited: boolean; // 无限弹幕
   synchronousPlayback: boolean; // 同步播放
+  maxCount?: number; // 弹幕加载上限
 }
 
 // 自动匹配请求
@@ -114,4 +115,6 @@ export interface DanmakuSelection {
   animeTitle: string;
   episodeTitle: string;
   searchKeyword?: string; // 用户搜索时使用的关键词
+  danmakuCount?: number; // 弹幕数量
+  danmakuOriginalCount?: number; // 原始弹幕数量
 }

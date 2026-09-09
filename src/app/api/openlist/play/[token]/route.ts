@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
 import { OpenListClient } from '@/lib/openlist.client';
+import { hasFeaturePermission } from '@/lib/permissions';
 
 export const runtime = 'nodejs';
 
@@ -22,15 +23,35 @@ export async function GET(
   try {
     const { searchParams } = new URL(request.url);
 
-    // 双重验证：TVBox Token 或 用户登录
+    // 双重验证：TVBox Token（全局或用户） 或 用户登录
     const requestToken = params.token;
-    const subscribeToken = process.env.TVBOX_SUBSCRIBE_TOKEN;
+    const globalToken = process.env.TVBOX_SUBSCRIBE_TOKEN;
     const authInfo = getAuthInfoFromCookie(request);
 
-    // 验证 TVBox Token
-    const hasValidToken = subscribeToken && requestToken === subscribeToken;
+    // 验证 TVBox Token（全局token或用户token）
+    let hasValidToken = false;
+    if (globalToken && requestToken === globalToken) {
+      // 全局token
+      hasValidToken = true;
+    } else {
+      // 检查是否是用户token
+      const { db } = await import('@/lib/db');
+      const username = await db.getUsernameByTvboxToken(requestToken);
+      if (username) {
+        // 检查用户是否被封禁
+        const userInfo = await db.getUserInfoV2(username);
+        const allowed = await hasFeaturePermission(username, 'private_library');
+        if (userInfo && !userInfo.banned && allowed) {
+          hasValidToken = true;
+        }
+      }
+    }
+
     // 验证用户登录
-    const hasValidAuth = authInfo && authInfo.username;
+    const hasValidAuth = !!(
+      authInfo?.username &&
+      (await hasFeaturePermission(authInfo.username, 'private_library'))
+    );
 
     // 两者至少满足其一
     if (!hasValidToken && !hasValidAuth) {
@@ -60,6 +81,32 @@ export async function GET(
     const rootPath = openListConfig.RootPath || '/';
     const folderPath = `${rootPath}${rootPath.endsWith('/') ? '' : '/'}${folderName}`;
     const filePath = `${folderPath}/${fileName}`;
+
+    // 解析路径元信息：路径开启代理播放时重定向到服务器代理地址
+    const { resolvePathMeta } = await import('@/lib/openlist-path-meta');
+    const pathMetaResolved = resolvePathMeta(
+      folderName,
+      openListConfig.PathMeta
+    );
+
+    if (pathMetaResolved.proxyPlay) {
+      const { buildOpenListProxyUrl } = await import('@/lib/openlist-play-url');
+      const host =
+        request.headers.get('host') || request.headers.get('x-forwarded-host');
+      const proto =
+        request.headers.get('x-forwarded-proto') ||
+        (host?.includes('localhost') || host?.includes('127.0.0.1')
+          ? 'http'
+          : 'https');
+      const baseUrl = process.env.SITE_BASE || `${proto}://${host}`;
+      const proxyUrl = buildOpenListProxyUrl({
+        token: requestToken,
+        folder: folderName,
+        fileName,
+        baseUrl,
+      });
+      return NextResponse.redirect(proxyUrl);
+    }
 
     const client = new OpenListClient(
       openListConfig.URL,

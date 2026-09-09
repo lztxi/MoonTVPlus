@@ -6,8 +6,28 @@ import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
 import { db } from '@/lib/db';
 import { OpenListClient } from '@/lib/openlist.client';
+import {
+  normalizeOpenListPath,
+  normalizePathMetaMap,
+  type OpenListPathMetaMap,
+} from '@/lib/openlist-path-meta';
+import { normalizeApiBaseUrl } from '@/lib/url';
 
 export const runtime = 'nodejs';
+
+/**
+ * 清理字符串中的 BOM 和其他不可见字符
+ */
+function cleanPath(path: string): string {
+  return normalizeOpenListPath(path);
+}
+
+function parsePathMeta(raw: unknown): OpenListPathMetaMap {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  return normalizePathMetaMap(raw as OpenListPathMetaMap);
+}
 
 /**
  * POST /api/admin/openlist
@@ -26,7 +46,23 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json();
-    const { action, Enabled, URL, Username, Password, RootPath, OfflineDownloadPath, ScanInterval } = body;
+    const {
+      action,
+      Enabled,
+      URL,
+      Username,
+      Password,
+      RootPaths,
+      OfflineDownloadPath,
+      OfflineDownloadUseCustomSource,
+      OfflineDownloadURL,
+      OfflineDownloadUsername,
+      OfflineDownloadPassword,
+      ScanInterval,
+      ScanMode,
+      DisableVideoPreview,
+      PathMeta,
+    } = body;
 
     const authInfo = getAuthInfoFromCookie(request);
     if (!authInfo || !authInfo.username) {
@@ -46,18 +82,29 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'save') {
+      const cleanedPathMeta = parsePathMeta(PathMeta);
+      const normalizedURL = normalizeApiBaseUrl(URL);
+      const normalizedOfflineDownloadURL = normalizeApiBaseUrl(OfflineDownloadURL);
+
       // 如果功能未启用，允许保存空配置
       if (!Enabled) {
         adminConfig.OpenListConfig = {
           Enabled: false,
-          URL: URL || '',
+          URL: normalizedURL,
           Username: Username || '',
           Password: Password || '',
-          RootPath: RootPath || '/',
+          RootPaths: RootPaths || ['/'],
           OfflineDownloadPath: OfflineDownloadPath || '/',
+          OfflineDownloadUseCustomSource: OfflineDownloadUseCustomSource || false,
+          OfflineDownloadURL: normalizedOfflineDownloadURL,
+          OfflineDownloadUsername: OfflineDownloadUsername || '',
+          OfflineDownloadPassword: OfflineDownloadPassword || '',
           LastRefreshTime: adminConfig.OpenListConfig?.LastRefreshTime,
           ResourceCount: adminConfig.OpenListConfig?.ResourceCount,
           ScanInterval: 0,
+          ScanMode: ScanMode || 'hybrid',
+          DisableVideoPreview: DisableVideoPreview || false,
+          PathMeta: cleanedPathMeta,
         };
 
         await db.saveAdminConfig(adminConfig);
@@ -69,15 +116,38 @@ export async function POST(request: NextRequest) {
       }
 
       // 功能启用时，验证必填字段
-      if (!URL || !Username || !Password) {
+      if (!normalizedURL || !Username || !Password) {
         return NextResponse.json(
           { error: '请提供 URL、账号和密码' },
           { status: 400 }
         );
       }
 
+      if (
+        OfflineDownloadUseCustomSource &&
+        (!normalizedOfflineDownloadURL ||
+          !OfflineDownloadUsername ||
+          !OfflineDownloadPassword)
+      ) {
+        return NextResponse.json(
+          { error: '请提供离线下载 OpenList URL、账号和密码' },
+          { status: 400 }
+        );
+      }
+
+      // 验证 RootPaths
+      if (!Array.isArray(RootPaths) || RootPaths.length === 0) {
+        return NextResponse.json(
+          { error: '请至少提供一个根目录' },
+          { status: 400 }
+        );
+      }
+
+      // 清理 RootPaths 中的 BOM 和不可见字符
+      const cleanedRootPaths = RootPaths.map(cleanPath);
+
       // 验证扫描间隔
-      let scanInterval = parseInt(ScanInterval) || 0;
+      const scanInterval = parseInt(ScanInterval) || 0;
       if (scanInterval > 0 && scanInterval < 60) {
         return NextResponse.json(
           { error: '定时扫描间隔最低为 60 分钟' },
@@ -88,7 +158,7 @@ export async function POST(request: NextRequest) {
       // 验证账号密码是否正确
       try {
         console.log('[OpenList Config] 验证账号密码');
-        await OpenListClient.login(URL, Username, Password);
+        await OpenListClient.login(normalizedURL, Username, Password);
         console.log('[OpenList Config] 账号密码验证成功');
       } catch (error) {
         console.error('[OpenList Config] 账号密码验证失败:', error);
@@ -98,16 +168,41 @@ export async function POST(request: NextRequest) {
         );
       }
 
+      if (OfflineDownloadUseCustomSource) {
+        try {
+          console.log('[OpenList Config] 验证离线下载 OpenList 账号密码');
+          await OpenListClient.login(
+            normalizedOfflineDownloadURL,
+            OfflineDownloadUsername,
+            OfflineDownloadPassword
+          );
+          console.log('[OpenList Config] 离线下载 OpenList 账号密码验证成功');
+        } catch (error) {
+          console.error('[OpenList Config] 离线下载 OpenList 账号密码验证失败:', error);
+          return NextResponse.json(
+            { error: '离线下载 OpenList 账号密码验证失败: ' + (error as Error).message },
+            { status: 400 }
+          );
+        }
+      }
+
       adminConfig.OpenListConfig = {
         Enabled: true,
-        URL,
+        URL: normalizedURL,
         Username,
         Password,
-        RootPath: RootPath || '/',
+        RootPaths: cleanedRootPaths,
         OfflineDownloadPath: OfflineDownloadPath || '/',
+        OfflineDownloadUseCustomSource: OfflineDownloadUseCustomSource || false,
+        OfflineDownloadURL: normalizedOfflineDownloadURL,
+        OfflineDownloadUsername: OfflineDownloadUsername || '',
+        OfflineDownloadPassword: OfflineDownloadPassword || '',
         LastRefreshTime: adminConfig.OpenListConfig?.LastRefreshTime,
         ResourceCount: adminConfig.OpenListConfig?.ResourceCount,
         ScanInterval: scanInterval,
+        ScanMode: ScanMode || 'hybrid',
+        DisableVideoPreview: DisableVideoPreview || false,
+        PathMeta: cleanedPathMeta,
       };
 
       await db.saveAdminConfig(adminConfig);

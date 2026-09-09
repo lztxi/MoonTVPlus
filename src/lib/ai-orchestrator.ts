@@ -5,8 +5,9 @@
  */
 
 import { fetchDoubanData as fetchDoubanAPI } from '@/lib/douban';
-import { searchTMDB, getTVSeasons } from '@/lib/tmdb.search';
 import { getNextApiKey } from '@/lib/tmdb.client';
+import { normalizeApiBaseUrl } from '@/lib/url';
+import { parseStringPromise } from 'xml2js';
 
 export interface VideoContext {
   title?: string;
@@ -136,9 +137,9 @@ function extractEntities(message: string): Array<{ type: string; value: string }
 /**
  * 获取联网搜索结果
  */
-async function fetchWebSearch(
+export async function fetchWebSearch(
   query: string,
-  provider: 'tavily' | 'serper' | 'serpapi',
+  provider: 'tavily' | 'serper' | 'serpapi' | 'bing',
   apiKey: string
 ): Promise<any> {
   try {
@@ -190,6 +191,27 @@ async function fetchWebSearch(
       }
 
       return await response.json();
+    } else if (provider === 'bing') {
+      const response = await fetch(
+        `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`,
+        {
+          headers: {
+            Accept: 'application/rss+xml, application/xml, text/xml',
+            'User-Agent': 'Mozilla/5.0 (compatible; MoonTVPlusBot/1.0)',
+          },
+        }
+      );
+      if (!response.ok) throw new Error(`Bing RSS error: ${response.status}`);
+      const parsed = await parseStringPromise(await response.text(), { trim: true });
+      const items = parsed?.rss?.channel?.[0]?.item || [];
+      return {
+        items: items.slice(0, 5).map((item: any) => ({
+          title: item.title?.[0] || '',
+          snippet: item.description?.[0] || '',
+          link: item.link?.[0] || '',
+          pubDate: item.pubDate?.[0] || '',
+        })),
+      };
     }
   } catch (error) {
     console.error('Web search error:', error);
@@ -201,7 +223,7 @@ async function fetchWebSearch(
  * 获取豆瓣数据
  * 服务器端直接调用豆瓣API
  */
-async function fetchDoubanData(params: {
+export async function fetchDoubanData(params: {
   id?: number;
   query?: string;
   kind?: string;
@@ -243,13 +265,14 @@ async function fetchDoubanData(params: {
  * 获取TMDB数据
  * 服务器端直接调用TMDB API
  */
-async function fetchTMDBData(
+export async function fetchTMDBData(
   params: {
     id?: number;
     type?: 'movie' | 'tv';
   },
   tmdbApiKey?: string,
-  tmdbProxy?: string
+  tmdbProxy?: string,
+  tmdbReverseProxy?: string
 ): Promise<any> {
   try {
     const actualKey = getNextApiKey(tmdbApiKey || '');
@@ -263,9 +286,11 @@ async function fetchTMDBData(
       return null;
     }
 
+    // 使用反代代理或默认 Base URL
+    const baseUrl = tmdbReverseProxy || 'https://api.themoviedb.org';
     // 使用 TMDB API 获取详情
     // TMDB API: https://api.themoviedb.org/3/{type}/{id}
-    const url = `https://api.themoviedb.org/3/${params.type}/${params.id}?api_key=${actualKey}&language=zh-CN&append_to_response=keywords,similar`;
+    const url = `${baseUrl}/3/${params.type}/${params.id}?api_key=${actualKey}&language=zh-CN&append_to_response=keywords,similar`;
 
     console.log('📡 获取TMDB详情:', params.type, params.id);
 
@@ -295,9 +320,9 @@ async function fetchTMDBData(
 /**
  * 格式化搜索结果为文本
  */
-function formatSearchResults(
+export function formatSearchResults(
   results: any,
-  provider: 'tavily' | 'serper' | 'serpapi'
+  provider: 'tavily' | 'serper' | 'serpapi' | 'bing'
 ): string {
   if (!results) return '';
 
@@ -332,6 +357,17 @@ function formatSearchResults(
 `
         )
         .join('\n');
+    } else if (provider === 'bing' && results.items) {
+      return results.items
+        .map(
+          (r: any) => `
+标题: ${r.title}
+摘要: ${r.snippet}
+来源: ${r.link}
+时间: ${r.pubDate || '未知'}
+`
+        )
+        .join('\n');
     }
   } catch (error) {
     console.error('Format search results error:', error);
@@ -344,14 +380,19 @@ function formatSearchResults(
  * 清理可能被代码块包裹的JSON字符串
  */
 function cleanJsonResponse(content: string): string {
-  // 去除可能的markdown代码块标记
   let cleaned = content.trim();
 
-  // 移除 ```json 或 ``` 开头
-  cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '');
-
-  // 移除 ``` 结尾
-  cleaned = cleaned.replace(/\n?```\s*$/, '');
+  // 尝试提取代码块中的内容（支持前面有说明文字的情况）
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/i);
+  if (codeBlockMatch) {
+    cleaned = codeBlockMatch[1].trim();
+  } else {
+    // 如果没有代码块，尝试提取第一个 { 到最后一个 } 之间的内容
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleaned = jsonMatch[0];
+    }
+  }
 
   return cleaned.trim();
 }
@@ -461,7 +502,9 @@ ${availableSources.length === 0 ? '⚠️ 没有可用的数据源，请返回�
       }
     } else {
       // OpenAI 或 自定义 (OpenAI兼容格式)
-      const baseURL = config.baseURL || 'https://api.openai.com/v1';
+      const baseURL = normalizeApiBaseUrl(
+        config.baseURL || 'https://api.openai.com/v1'
+      );
       response = await fetch(`${baseURL}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -510,13 +553,14 @@ export async function orchestrateDataSources(
   context?: VideoContext,
   config?: {
     enableWebSearch: boolean;
-    webSearchProvider?: 'tavily' | 'serper' | 'serpapi';
+    webSearchProvider?: 'tavily' | 'serper' | 'serpapi' | 'bing';
     tavilyApiKey?: string;
     serperApiKey?: string;
     serpApiKey?: string;
     // TMDB 配置
     tmdbApiKey?: string;
     tmdbProxy?: string;
+    tmdbReverseProxy?: string;
     // 决策模型配置
     enableDecisionModel?: boolean;
     decisionProvider?: 'openai' | 'claude' | 'custom';
@@ -538,7 +582,8 @@ export async function orchestrateDataSources(
       (
         (config.webSearchProvider === 'tavily' && config.tavilyApiKey) ||
         (config.webSearchProvider === 'serper' && config.serperApiKey) ||
-        (config.webSearchProvider === 'serpapi' && config.serpApiKey)
+        (config.webSearchProvider === 'serpapi' && config.serpApiKey) ||
+        config.webSearchProvider === 'bing'
       ));
 
     const hasTMDB = !!(config.tmdbApiKey);
@@ -607,12 +652,14 @@ export async function orchestrateDataSources(
         ? config.tavilyApiKey
         : provider === 'serper'
           ? config.serperApiKey
-          : config.serpApiKey;
+          : provider === 'serpapi'
+            ? config.serpApiKey
+            : '';
 
-    if (apiKey) {
+    if (apiKey || provider === 'bing') {
       // 使用决策模型优化的查询，如果没有则使用原始消息
       const searchQuery = (intent as any).optimizedWebSearchQuery || userMessage;
-      webSearchPromise = fetchWebSearch(searchQuery, provider, apiKey);
+      webSearchPromise = fetchWebSearch(searchQuery, provider, apiKey || '');
       dataPromises.push(webSearchPromise);
     }
   }
@@ -653,7 +700,8 @@ export async function orchestrateDataSources(
         type: context.type,
       },
       config?.tmdbApiKey,
-      config?.tmdbProxy
+      config?.tmdbProxy,
+      config?.tmdbReverseProxy
     );
     dataPromises.push(tmdbPromise);
   }
@@ -686,7 +734,14 @@ export async function orchestrateDataSources(
   }
 
   // 4. 构建系统提示词
+  // 获取UTC+8时区的日期
+  const now = new Date();
+  const utc8Date = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const today = utc8Date.toISOString().split('T')[0]; // YYYY-MM-DD格式
   let systemPrompt = `你是 MoonTVPlus 的 AI 影视助手，专门帮助用户发现和了解影视内容。
+
+## 当前日期
+${today}
 
 ## 你的能力
 - 提供影视推荐（基于豆瓣热门榜单和TMDB数据）

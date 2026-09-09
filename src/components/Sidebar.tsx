@@ -2,7 +2,7 @@
 
 'use client';
 
-import { Cat, Clover, Film, FolderOpen, Home, Menu, Radio, Search, Star, Tv, Users } from 'lucide-react';
+import { Blend, Cat, Clover, Container, Film, Globe, Home, Menu, Search, Star, Tv, TvMinimalPlay, Users } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useSearchParams } from 'next/navigation';
 import {
@@ -63,6 +63,10 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const watchRoomContext = useWatchRoomContextSafe();
+
+  if (pathname === '/watch-room/screen') {
+    return null;
+  }
   // 若同一次 SPA 会话中已经读取过折叠状态，则直接复用，避免闪烁
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
     if (
@@ -143,8 +147,8 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
       href: '/douban?type=show',
     },
     {
-      icon: Radio,
-      label: '直播',
+      icon: TvMinimalPlay,
+      label: '电视直播',
       href: '/live',
     },
   ]);
@@ -153,7 +157,7 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
     const runtimeConfig = (window as any).RUNTIME_CONFIG;
 
     // 基础菜单项（不包括观影室）
-    let items = [
+    const items = [
       {
         icon: Film,
         label: '电影',
@@ -174,19 +178,40 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
         label: '综艺',
         href: '/douban?type=show',
       },
-      {
-        icon: Radio,
-        label: '直播',
-        href: '/live',
-      },
+      ...(runtimeConfig?.LIVE_ENABLED
+        ? [
+            {
+              icon: TvMinimalPlay,
+              label: '电视直播',
+              href: '/live',
+            },
+          ]
+        : []),
     ];
 
-    // 如果配置了 OpenList，添加私人影库入口
-    if (runtimeConfig?.OPENLIST_ENABLED) {
+    // 如果启用网络直播，添加网络直播入口
+    if (runtimeConfig?.WEB_LIVE_ENABLED) {
       items.push({
-        icon: FolderOpen,
+        icon: Globe,
+        label: '网络直播',
+        href: '/web-live',
+      });
+    }
+
+    // 如果配置了 OpenList 或 Emby，添加私人影库入口
+    if (runtimeConfig?.PRIVATE_LIBRARY_ENABLED) {
+      items.push({
+        icon: Container,
         label: '私人影库',
         href: '/private-library',
+      });
+    }
+
+    if (runtimeConfig?.ADVANCED_RECOMMENDATION_ENABLED) {
+      items.push({
+        icon: Blend,
+        label: '高级推荐',
+        href: '/advanced-recommendation',
       });
     }
 
@@ -294,10 +319,16 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
                   const decodedActive = decodeURIComponent(active);
                   const decodedItemHref = decodeURIComponent(item.href);
 
+                  // 提取路径名（不包含查询参数）
+                  const activePathname = decodedActive.split('?')[0];
+                  const itemPathname = decodedItemHref.split('?')[0];
+
                   const isActive =
                     decodedActive === decodedItemHref ||
                     (decodedActive.startsWith('/douban') &&
-                      decodedActive.includes(`type=${typeMatch}`));
+                      decodedActive.includes(`type=${typeMatch}`)) ||
+                    // 对于没有type参数的路径，只比较路径名
+                    (!typeMatch && activePathname === itemPathname);
                   const Icon = item.icon;
                   return (
                     <Link

@@ -49,6 +49,9 @@ interface CorrectDialogProps {
     seasonName?: string;
   };
   onCorrect: () => void;
+  source?: string;
+  useDrawer?: boolean;
+  drawerWidth?: string;
 }
 
 export default function CorrectDialog({
@@ -58,6 +61,9 @@ export default function CorrectDialog({
   currentTitle,
   currentVideo,
   onCorrect,
+  source = 'openlist',
+  useDrawer = false,
+  drawerWidth = 'w-full md:w-[25%]',
 }: CorrectDialogProps) {
   const [searchQuery, setSearchQuery] = useState(currentTitle);
   const [searching, setSearching] = useState(false);
@@ -223,14 +229,13 @@ export default function CorrectDialog({
     try {
       // 构建标题和ID：如果是第二季及以后，在标题后加上季度名称，并使用季度ID
       let finalTitle = result.title || result.name;
-      let finalTmdbId = result.id;
+      const finalTmdbId = result.id;
 
       if (season && season.season_number > 1) {
         finalTitle = `${finalTitle} ${season.name}`;
       }
 
-      const body: any = {
-        key: videoKey,
+      const correctionData: any = {
         tmdbId: finalTmdbId,
         title: finalTitle,
         posterPath: season?.poster_path || result.poster_path,
@@ -240,20 +245,38 @@ export default function CorrectDialog({
         mediaType: result.media_type,
       };
 
-      // 如果有季度信息，添加到请求中
+      // 如果有季度信息，添加到数据中
       if (season) {
-        body.seasonNumber = season.season_number;
-        body.seasonName = season.name;
+        correctionData.seasonNumber = season.season_number;
+        correctionData.seasonName = season.name;
       }
 
-      const response = await fetch('/api/openlist/correct', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      // 根据源类型选择不同的存储方式
+      if (source === 'xiaoya') {
+        // 小雅源：存储到 localStorage
+        const storageKey = `xiaoya_correction_${videoKey}`;
+        const correctionInfo = {
+          ...correctionData,
+          correctedAt: Date.now(),
+        };
+        localStorage.setItem(storageKey, JSON.stringify(correctionInfo));
+        console.log('小雅源纠错信息已存储到 localStorage:', storageKey, correctionInfo);
+      } else {
+        // openlist 等其他源：调用 API
+        const body: any = {
+          key: videoKey,
+          ...correctionData,
+        };
 
-      if (!response.ok) {
-        throw new Error('纠错失败');
+        const response = await fetch('/api/openlist/correct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          throw new Error('纠错失败');
+        }
       }
 
       onCorrect();
@@ -313,8 +336,7 @@ export default function CorrectDialog({
     setError('');
 
     try {
-      const body: any = {
-        key: videoKey,
+      const correctionData: any = {
         title: manualData.title.trim(),
         posterPath: manualData.posterPath.trim() || null,
         releaseDate: manualData.releaseDate.trim() || '',
@@ -325,28 +347,46 @@ export default function CorrectDialog({
 
       // 添加 TMDB ID（如果提供）
       if (manualData.tmdbId.trim()) {
-        body.tmdbId = Number(manualData.tmdbId);
+        correctionData.tmdbId = Number(manualData.tmdbId);
       }
 
       // 添加豆瓣 ID（如果提供）
       if (manualData.doubanId.trim()) {
-        body.doubanId = manualData.doubanId.trim();
+        correctionData.doubanId = manualData.doubanId.trim();
       }
 
       // 如果是电视剧且有季度信息
       if (manualData.mediaType === 'tv' && manualData.seasonNumber) {
-        body.seasonNumber = Number(manualData.seasonNumber);
-        body.seasonName = manualData.seasonName.trim() || `第 ${manualData.seasonNumber} 季`;
+        correctionData.seasonNumber = Number(manualData.seasonNumber);
+        correctionData.seasonName = manualData.seasonName.trim() || `第 ${manualData.seasonNumber} 季`;
       }
 
-      const response = await fetch('/api/openlist/correct', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      // 根据源类型选择不同的存储方式
+      if (source === 'xiaoya') {
+        // 小雅源：存储到 localStorage
+        const storageKey = `xiaoya_correction_${videoKey}`;
+        const correctionInfo = {
+          ...correctionData,
+          correctedAt: Date.now(),
+        };
+        localStorage.setItem(storageKey, JSON.stringify(correctionInfo));
+        console.log('小雅源纠错信息已存储到 localStorage:', storageKey, correctionInfo);
+      } else {
+        // openlist 等其他源：调用 API
+        const body: any = {
+          key: videoKey,
+          ...correctionData,
+        };
 
-      if (!response.ok) {
-        throw new Error('纠错失败');
+        const response = await fetch('/api/openlist/correct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          throw new Error('纠错失败');
+        }
       }
 
       onCorrect();
@@ -361,21 +401,20 @@ export default function CorrectDialog({
 
   if (!isOpen) return null;
 
-  return createPortal(
-    <div className='fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm'>
-      <div className='bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col m-4'>
-        {/* 头部 */}
-        <div className='flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700'>
-          <h2 className='text-lg font-semibold text-gray-900 dark:text-gray-100'>
-            纠错：{currentTitle}
-          </h2>
-          <button
-            onClick={onClose}
-            className='text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
-          >
-            <X size={24} />
-          </button>
-        </div>
+  const dialogContent = (
+    <>
+      {/* 头部 */}
+      <div className='flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700'>
+        <h2 className='text-lg font-semibold text-gray-900 dark:text-gray-100'>
+          纠错：{currentTitle}
+        </h2>
+        <button
+          onClick={onClose}
+          className='text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'
+        >
+          <X size={24} />
+        </button>
+      </div>
 
         {/* 搜索框 */}
         {!showManualInput && (
@@ -774,8 +813,23 @@ export default function CorrectDialog({
             </>
           )}
         </div>
+      </>
+    );
+
+  return createPortal(
+    useDrawer ? (
+      <div className='fixed inset-0 z-[9999] flex items-center justify-end pointer-events-none'>
+        <div className={`relative ${drawerWidth} h-full bg-white dark:bg-gray-800 shadow-2xl flex flex-col pointer-events-auto`}>
+          {dialogContent}
+        </div>
       </div>
-    </div>,
+    ) : (
+      <div className='fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm'>
+        <div className='bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col m-4'>
+          {dialogContent}
+        </div>
+      </div>
+    ),
     document.body
   );
 }

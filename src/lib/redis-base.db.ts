@@ -1,9 +1,18 @@
 /* eslint-disable no-console, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
-import { createClient, RedisClientType } from 'redis';
-
 import { AdminConfig } from './admin.types';
-import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import { MangaReadRecord, MangaShelfItem } from './manga.types';
+import { BookReadRecord, BookShelfItem } from './book.types';
+import {
+  MusicV2HistoryRecord,
+  MusicV2PlaylistItem,
+  MusicV2PlaylistRecord,
+  sortMusicV2History,
+} from './music-v2';
+import { RedisAdapter } from './redis-adapter';
+import { Favorite, IStorage, LocalSettingsSyncRecord, Notification, PlayRecord, PushSubscriptionRecord, SetLocalSettingsSyncOptions, SetLocalSettingsSyncResult, SkipConfig } from './types';
+import { userInfoCache } from './user-cache';
+import { dispatchNotificationChannels } from './notification-dispatch';
 
 // 搜索历史最大条数
 const SEARCH_HISTORY_LIMIT = 20;
@@ -20,137 +29,51 @@ function ensureStringArray(value: any[]): string[] {
 // 内存锁：用于防止同一用户的并发播放记录操作（迁移、清理等）
 const playRecordLocks = new Map<string, Promise<void>>();
 
-// 连接配置接口
-export interface RedisConnectionConfig {
-  url: string;
-  clientName: string; // 用于日志显示，如 "Redis" 或 "Pika"
-}
-
-// 添加Redis操作重试包装器
-function createRetryWrapper(clientName: string, getClient: () => RedisClientType) {
-  return async function withRetry<T>(
-    operation: () => Promise<T>,
-    maxRetries = 3
-  ): Promise<T> {
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        return await operation();
-      } catch (err: any) {
-        const isLastAttempt = i === maxRetries - 1;
-        const isConnectionError =
-          err.message?.includes('Connection') ||
-          err.message?.includes('ECONNREFUSED') ||
-          err.message?.includes('ENOTFOUND') ||
-          err.code === 'ECONNRESET' ||
-          err.code === 'EPIPE';
-
-        if (isConnectionError && !isLastAttempt) {
-          console.log(
-            `${clientName} operation failed, retrying... (${i + 1}/${maxRetries})`
-          );
-          console.error('Error:', err.message);
-
-          // 等待一段时间后重试
-          await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
-
-          // 尝试重新连接
-          try {
-            const client = getClient();
-            if (!client.isOpen) {
-              await client.connect();
-            }
-          } catch (reconnectErr) {
-            console.error('Failed to reconnect:', reconnectErr);
-          }
-
-          continue;
-        }
-
-        throw err;
-      }
-    }
-
-    throw new Error('Max retries exceeded');
-  };
-}
-
-// 创建客户端的工厂函数
-export function createRedisClient(config: RedisConnectionConfig, globalSymbol: symbol): RedisClientType {
-  let client: RedisClientType | undefined = (global as any)[globalSymbol];
-
-  if (!client) {
-    if (!config.url) {
-      throw new Error(`${config.clientName}_URL env variable not set`);
-    }
-
-    // 创建客户端配置
-    const clientConfig: any = {
-      url: config.url,
-      socket: {
-        // 重连策略：指数退避，最大30秒
-        reconnectStrategy: (retries: number) => {
-          console.log(`${config.clientName} reconnection attempt ${retries + 1}`);
-          if (retries > 10) {
-            console.error(`${config.clientName} max reconnection attempts exceeded`);
-            return false; // 停止重连
-          }
-          return Math.min(1000 * Math.pow(2, retries), 30000); // 指数退避，最大30秒
-        },
-        connectTimeout: 10000, // 10秒连接超时
-        // 设置no delay，减少延迟
-        noDelay: true,
-      },
-      // 添加其他配置
-      pingInterval: 30000, // 30秒ping一次，保持连接活跃
-    };
-
-    client = createClient(clientConfig);
-
-    // 添加错误事件监听
-    client.on('error', (err) => {
-      console.error(`${config.clientName} client error:`, err);
-    });
-
-    client.on('connect', () => {
-      console.log(`${config.clientName} connected`);
-    });
-
-    client.on('reconnecting', () => {
-      console.log(`${config.clientName} reconnecting...`);
-    });
-
-    client.on('ready', () => {
-      console.log(`${config.clientName} ready`);
-    });
-
-    // 初始连接，带重试机制
-    const connectWithRetry = async () => {
-      try {
-        await client!.connect();
-        console.log(`${config.clientName} connected successfully`);
-      } catch (err) {
-        console.error(`${config.clientName} initial connection failed:`, err);
-        console.log('Will retry in 5 seconds...');
-        setTimeout(connectWithRetry, 5000);
-      }
-    };
-
-    connectWithRetry();
-
-    (global as any)[globalSymbol] = client;
-  }
-
-  return client;
-}
-
 // 抽象基类，包含所有通用的Redis操作逻辑
 export abstract class BaseRedisStorage implements IStorage {
-  protected client: RedisClientType;
-  protected withRetry: <T>(operation: () => Promise<T>, maxRetries?: number) => Promise<T>;
+  protected adapter: RedisAdapter;
+  protected withRetry: <T>(
+    operation: () => Promise<T>,
+    maxRetries?: number
+  ) => Promise<T>;
+  // 保留 client 属性用于向后兼容（数据迁移代码使用）
+  client: any;
 
-  constructor(config: RedisConnectionConfig, globalSymbol: symbol) {
-    this.client = createRedisClient(config, globalSymbol);
-    this.withRetry = createRetryWrapper(config.clientName, () => this.client);
+  constructor(
+    adapter: RedisAdapter,
+    withRetryFn: <T>(
+      operation: () => Promise<T>,
+      maxRetries?: number
+    ) => Promise<T>
+  ) {
+    this.adapter = adapter;
+    this.withRetry = withRetryFn;
+    // 创建兼容层，同时支持驼峰和小写命名（用于数据迁移代码）
+    this.client = {
+      hSet: (key: string, ...args: any[]) => {
+        if (args.length === 1) {
+          return this.adapter.hSet(key, args[0]);
+        }
+        return this.adapter.hSet(key, args[0], args[1]);
+      },
+      hset: (key: string, ...args: any[]) => {
+        if (args.length === 1) {
+          return this.adapter.hSet(key, args[0]);
+        }
+        return this.adapter.hSet(key, args[0], args[1]);
+      },
+      hGet: (key: string, field: string) => this.adapter.hGet(key, field),
+      hget: (key: string, field: string) => this.adapter.hGet(key, field),
+      hGetAll: (key: string) => this.adapter.hGetAll(key),
+      hgetall: (key: string) => this.adapter.hGetAll(key),
+      zAdd: (key: string, member: { score: number; value: string }) =>
+        this.adapter.zAdd(key, member),
+      zadd: (key: string, member: { score: number; value: string }) =>
+        this.adapter.zAdd(key, member),
+      set: (key: string, value: string) => this.adapter.set(key, value),
+      get: (key: string) => this.adapter.get(key),
+      del: (...keys: string[]) => this.adapter.del(keys),
+    };
   }
 
   // ---------- 播放记录 ----------
@@ -168,7 +91,7 @@ export abstract class BaseRedisStorage implements IStorage {
     key: string
   ): Promise<PlayRecord | null> {
     const val = await this.withRetry(() =>
-      this.client.hGet(this.prHashKey(userName), key)
+      this.adapter.hGet(this.prHashKey(userName), key)
     );
     return val ? (JSON.parse(val) as PlayRecord) : null;
   }
@@ -179,7 +102,7 @@ export abstract class BaseRedisStorage implements IStorage {
     record: PlayRecord
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.hSet(this.prHashKey(userName), key, JSON.stringify(record))
+      this.adapter.hSet(this.prHashKey(userName), key, JSON.stringify(record))
     );
   }
 
@@ -187,7 +110,7 @@ export abstract class BaseRedisStorage implements IStorage {
     userName: string
   ): Promise<Record<string, PlayRecord>> {
     const hashData = await this.withRetry(() =>
-      this.client.hGetAll(this.prHashKey(userName))
+      this.adapter.hGetAll(this.prHashKey(userName))
     );
 
     const result: Record<string, PlayRecord> = {};
@@ -200,7 +123,17 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
-    await this.withRetry(() => this.client.hDel(this.prHashKey(userName), key));
+    await this.withRetry(() =>
+      this.adapter.hDel(this.prHashKey(userName), key)
+    );
+  }
+
+  async deletePlayRecords(userName: string, keys: string[]): Promise<void> {
+    const uniqueKeys = Array.from(new Set(keys)).filter(Boolean);
+    if (uniqueKeys.length === 0) return;
+    await this.withRetry(() =>
+      this.adapter.hDel(this.prHashKey(userName), ...uniqueKeys)
+    );
   }
 
   // 清理超出限制的旧播放记录
@@ -229,7 +162,10 @@ export abstract class BaseRedisStorage implements IStorage {
   private async doCleanup(userName: string): Promise<void> {
     try {
       // 获取配置的最大播放记录数，默认100
-      const maxRecords = parseInt(process.env.MAX_PLAY_RECORDS_PER_USER || '100', 10);
+      const maxRecords = parseInt(
+        process.env.MAX_PLAY_RECORDS_PER_USER || '100',
+        10
+      );
       const threshold = maxRecords + 10; // 超过最大值+10时才触发清理
 
       // 获取所有播放记录
@@ -241,7 +177,9 @@ export abstract class BaseRedisStorage implements IStorage {
         return;
       }
 
-      console.log(`用户 ${userName} 的播放记录数 ${recordCount} 超过阈值 ${threshold}，开始清理...`);
+      console.log(
+        `用户 ${userName} 的播放记录数 ${recordCount} 超过阈值 ${threshold}，开始清理...`
+      );
 
       // 将记录转换为数组并按 save_time 排序（从旧到新）
       const sortedRecords = Object.entries(allRecords).sort(
@@ -299,13 +237,19 @@ export abstract class BaseRedisStorage implements IStorage {
 
     // 2. 获取旧结构的所有播放记录key
     const pattern = `u:${userName}:pr:*`;
-    const oldKeys: string[] = await this.withRetry(() => this.client.keys(pattern));
+    const oldKeys: string[] = await this.withRetry(() =>
+      this.adapter.keys(pattern)
+    );
 
     if (oldKeys.length === 0) {
       console.log(`用户 ${userName} 没有旧的播放记录，标记为已迁移`);
       // 即使没有数据也标记为已迁移
       await this.withRetry(() =>
-        this.client.hSet(this.userInfoKey(userName), 'playrecord_migrated', 'true')
+        this.adapter.hSet(
+          this.userInfoKey(userName),
+          'playrecord_migrated',
+          'true'
+        )
       );
       // 清除用户信息缓存
       const { userInfoCache } = await import('./user-cache');
@@ -316,7 +260,7 @@ export abstract class BaseRedisStorage implements IStorage {
     console.log(`找到 ${oldKeys.length} 条旧播放记录，开始迁移...`);
 
     // 3. 批量获取旧数据
-    const oldValues = await this.withRetry(() => this.client.mGet(oldKeys));
+    const oldValues = await this.withRetry(() => this.adapter.mGet(oldKeys));
 
     // 4. 转换为hash格式
     const hashData: Record<string, string> = {};
@@ -332,18 +276,24 @@ export abstract class BaseRedisStorage implements IStorage {
     // 5. 写入新的hash结构
     if (Object.keys(hashData).length > 0) {
       await this.withRetry(() =>
-        this.client.hSet(this.prHashKey(userName), hashData)
+        this.adapter.hSet(this.prHashKey(userName), hashData)
       );
-      console.log(`成功迁移 ${Object.keys(hashData).length} 条播放记录到hash结构`);
+      console.log(
+        `成功迁移 ${Object.keys(hashData).length} 条播放记录到hash结构`
+      );
     }
 
     // 6. 删除旧的key
-    await this.withRetry(() => this.client.del(oldKeys));
+    await this.withRetry(() => this.adapter.del(oldKeys));
     console.log(`删除了 ${oldKeys.length} 个旧的播放记录key`);
 
     // 7. 标记迁移完成
     await this.withRetry(() =>
-      this.client.hSet(this.userInfoKey(userName), 'playrecord_migrated', 'true')
+      this.adapter.hSet(
+        this.userInfoKey(userName),
+        'playrecord_migrated',
+        'true'
+      )
     );
 
     // 8. 清除用户信息缓存，确保下次获取时能读取到最新的迁移标识
@@ -365,7 +315,7 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async getFavorite(userName: string, key: string): Promise<Favorite | null> {
     const val = await this.withRetry(() =>
-      this.client.hGet(this.favHashKey(userName), key)
+      this.adapter.hGet(this.favHashKey(userName), key)
     );
     return val ? (JSON.parse(val) as Favorite) : null;
   }
@@ -376,13 +326,17 @@ export abstract class BaseRedisStorage implements IStorage {
     favorite: Favorite
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.hSet(this.favHashKey(userName), key, JSON.stringify(favorite))
+      this.adapter.hSet(
+        this.favHashKey(userName),
+        key,
+        JSON.stringify(favorite)
+      )
     );
   }
 
   async getAllFavorites(userName: string): Promise<Record<string, Favorite>> {
     const hashData = await this.withRetry(() =>
-      this.client.hGetAll(this.favHashKey(userName))
+      this.adapter.hGetAll(this.favHashKey(userName))
     );
 
     const result: Record<string, Favorite> = {};
@@ -395,7 +349,9 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async deleteFavorite(userName: string, key: string): Promise<void> {
-    await this.withRetry(() => this.client.hDel(this.favHashKey(userName), key));
+    await this.withRetry(() =>
+      this.adapter.hDel(this.favHashKey(userName), key)
+    );
   }
 
   // 迁移收藏：从旧的多key结构迁移到新的hash结构
@@ -433,13 +389,19 @@ export abstract class BaseRedisStorage implements IStorage {
 
     // 2. 获取旧结构的所有收藏key
     const pattern = `u:${userName}:fav:*`;
-    const oldKeys: string[] = await this.withRetry(() => this.client.keys(pattern));
+    const oldKeys: string[] = await this.withRetry(() =>
+      this.adapter.keys(pattern)
+    );
 
     if (oldKeys.length === 0) {
       console.log(`用户 ${userName} 没有旧的收藏，标记为已迁移`);
       // 即使没有数据也标记为已迁移
       await this.withRetry(() =>
-        this.client.hSet(this.userInfoKey(userName), 'favorite_migrated', 'true')
+        this.adapter.hSet(
+          this.userInfoKey(userName),
+          'favorite_migrated',
+          'true'
+        )
       );
       // 清除用户信息缓存
       const { userInfoCache } = await import('./user-cache');
@@ -450,7 +412,7 @@ export abstract class BaseRedisStorage implements IStorage {
     console.log(`找到 ${oldKeys.length} 条旧收藏，开始迁移...`);
 
     // 3. 批量获取旧数据
-    const oldValues = await this.withRetry(() => this.client.mGet(oldKeys));
+    const oldValues = await this.withRetry(() => this.adapter.mGet(oldKeys));
 
     // 4. 转换为hash格式
     const hashData: Record<string, string> = {};
@@ -466,18 +428,18 @@ export abstract class BaseRedisStorage implements IStorage {
     // 5. 写入新的hash结构
     if (Object.keys(hashData).length > 0) {
       await this.withRetry(() =>
-        this.client.hSet(this.favHashKey(userName), hashData)
+        this.adapter.hSet(this.favHashKey(userName), hashData)
       );
       console.log(`成功迁移 ${Object.keys(hashData).length} 条收藏到hash结构`);
     }
 
     // 6. 删除旧的key
-    await this.withRetry(() => this.client.del(oldKeys));
+    await this.withRetry(() => this.adapter.del(oldKeys));
     console.log(`删除了 ${oldKeys.length} 个旧的收藏key`);
 
     // 7. 标记迁移完成
     await this.withRetry(() =>
-      this.client.hSet(this.userInfoKey(userName), 'favorite_migrated', 'true')
+      this.adapter.hSet(this.userInfoKey(userName), 'favorite_migrated', 'true')
     );
 
     // 8. 清除用户信息缓存，确保下次获取时能读取到最新的迁移标识
@@ -487,6 +449,536 @@ export abstract class BaseRedisStorage implements IStorage {
     console.log(`用户 ${userName} 的收藏迁移完成`);
   }
 
+  // ---------- 音乐播放记录相关 ----------
+  private musicPlayRecordHashKey(userName: string) {
+    return `u:${userName}:music_play_records`;
+  }
+
+  async getMusicPlayRecord(userName: string, key: string): Promise<any | null> {
+    const value = await this.withRetry(() =>
+      this.adapter.hGet(this.musicPlayRecordHashKey(userName), key)
+    );
+    return value ? JSON.parse(value) : null;
+  }
+
+  async setMusicPlayRecord(
+    userName: string,
+    key: string,
+    record: any
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.musicPlayRecordHashKey(userName),
+        key,
+        JSON.stringify(record)
+      )
+    );
+  }
+
+  async batchSetMusicPlayRecords(
+    userName: string,
+    records: { key: string; record: any }[]
+  ): Promise<void> {
+    if (records.length === 0) return;
+
+    const hashKey = this.musicPlayRecordHashKey(userName);
+    const data: Record<string, string> = {};
+
+    for (const { key, record } of records) {
+      data[key] = JSON.stringify(record);
+    }
+
+    await this.withRetry(() => this.adapter.hSet(hashKey, data));
+  }
+
+  async getAllMusicPlayRecords(userName: string): Promise<Record<string, any>> {
+    const hashData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicPlayRecordHashKey(userName))
+    );
+
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) {
+        result[key] = JSON.parse(value);
+      }
+    }
+    return result;
+  }
+
+  async deleteMusicPlayRecord(userName: string, key: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.musicPlayRecordHashKey(userName), key)
+    );
+  }
+
+  async clearAllMusicPlayRecords(userName: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.del(this.musicPlayRecordHashKey(userName))
+    );
+  }
+
+  // ---------- 音乐歌单相关 ----------
+  private musicPlaylistsKey(userName: string) {
+    return `u:${userName}:music_playlists`;
+  }
+
+  private musicPlaylistKey(playlistId: string) {
+    return `music_playlist:${playlistId}`;
+  }
+
+  private musicPlaylistSongsKey(playlistId: string) {
+    return `music_playlist:${playlistId}:songs`;
+  }
+
+  async createMusicPlaylist(
+    userName: string,
+    playlist: {
+      id: string;
+      name: string;
+      description?: string;
+      cover?: string;
+    }
+  ): Promise<void> {
+    const now = Date.now();
+    const playlistData = {
+      id: playlist.id,
+      username: userName,
+      name: playlist.name,
+      description: playlist.description || '',
+      cover: playlist.cover || '',
+      created_at: now.toString(),
+      updated_at: now.toString(),
+    };
+
+    // 存储歌单信息
+    await this.withRetry(() =>
+      this.adapter.hSet(this.musicPlaylistKey(playlist.id), playlistData)
+    );
+
+    // 添加到用户的歌单列表（使用 sorted set，按创建时间排序）
+    await this.withRetry(() =>
+      this.adapter.zAdd(this.musicPlaylistsKey(userName), {
+        score: now,
+        value: playlist.id,
+      })
+    );
+  }
+
+  async getMusicPlaylist(playlistId: string): Promise<any | null> {
+    const data = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicPlaylistKey(playlistId))
+    );
+
+    if (!data || Object.keys(data).length === 0) return null;
+
+    return {
+      id: data.id,
+      username: data.username,
+      name: data.name,
+      description: data.description || undefined,
+      cover: data.cover || undefined,
+      created_at: parseInt(data.created_at, 10),
+      updated_at: parseInt(data.updated_at, 10),
+    };
+  }
+
+  async getUserMusicPlaylists(userName: string): Promise<any[]> {
+    // 获取用户的所有歌单ID（按创建时间倒序）
+    const playlistIds = await this.withRetry(() =>
+      this.adapter.zRange(this.musicPlaylistsKey(userName), 0, -1)
+    );
+
+    if (!playlistIds || playlistIds.length === 0) return [];
+
+    // 获取每个歌单的详细信息
+    const playlists = [];
+    for (const id of playlistIds) {
+      const playlist = await this.getMusicPlaylist(ensureString(id));
+      if (playlist) {
+        playlists.push(playlist);
+      }
+    }
+
+    // 按创建时间倒序排序
+    return playlists.sort((a, b) => b.created_at - a.created_at);
+  }
+
+  async updateMusicPlaylist(
+    playlistId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      cover?: string;
+    }
+  ): Promise<void> {
+    const updateData: Record<string, string> = {
+      updated_at: Date.now().toString(),
+    };
+
+    if (updates.name !== undefined) {
+      updateData.name = updates.name;
+    }
+    if (updates.description !== undefined) {
+      updateData.description = updates.description || '';
+    }
+    if (updates.cover !== undefined) {
+      updateData.cover = updates.cover || '';
+    }
+
+    await this.withRetry(() =>
+      this.adapter.hSet(this.musicPlaylistKey(playlistId), updateData)
+    );
+  }
+
+  async deleteMusicPlaylist(playlistId: string): Promise<void> {
+    // 获取歌单信息以获取用户名
+    const playlist = await this.getMusicPlaylist(playlistId);
+    if (!playlist) return;
+
+    // 从用户的歌单列表中移除
+    await this.withRetry(() =>
+      this.adapter.zRem(this.musicPlaylistsKey(playlist.username), playlistId)
+    );
+
+    // 删除歌单信息
+    await this.withRetry(() =>
+      this.adapter.del(this.musicPlaylistKey(playlistId))
+    );
+
+    // 删除歌单的歌曲列表
+    await this.withRetry(() =>
+      this.adapter.del(this.musicPlaylistSongsKey(playlistId))
+    );
+  }
+
+  async addSongToPlaylist(
+    playlistId: string,
+    song: {
+      platform: string;
+      id: string;
+      name: string;
+      artist: string;
+      album?: string;
+      pic?: string;
+      duration: number;
+    }
+  ): Promise<void> {
+    const now = Date.now();
+    const songKey = `${song.platform}+${song.id}`;
+
+    const songData = {
+      platform: song.platform,
+      id: song.id,
+      name: song.name,
+      artist: song.artist,
+      album: song.album || '',
+      pic: song.pic || '',
+      duration: song.duration.toString(),
+      added_at: now.toString(),
+    };
+
+    // 添加歌曲到歌单（使用 hash 存储歌曲信息）
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.musicPlaylistSongsKey(playlistId),
+        songKey,
+        JSON.stringify(songData)
+      )
+    );
+
+    // 更新歌单的 updated_at
+    await this.updateMusicPlaylist(playlistId, {});
+
+    // 如果是第一首歌且有封面，更新歌单封面
+    const songs = await this.getPlaylistSongs(playlistId);
+    if (songs.length === 1 && song.pic) {
+      await this.updateMusicPlaylist(playlistId, { cover: song.pic });
+    }
+  }
+
+  async removeSongFromPlaylist(
+    playlistId: string,
+    platform: string,
+    songId: string
+  ): Promise<void> {
+    const songKey = `${platform}+${songId}`;
+
+    await this.withRetry(() =>
+      this.adapter.hDel(this.musicPlaylistSongsKey(playlistId), songKey)
+    );
+
+    // 更新歌单的 updated_at
+    await this.updateMusicPlaylist(playlistId, {});
+  }
+
+  async getPlaylistSongs(playlistId: string): Promise<any[]> {
+    const songsData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicPlaylistSongsKey(playlistId))
+    );
+
+    if (!songsData || Object.keys(songsData).length === 0) return [];
+
+    const songs = [];
+    for (const [, value] of Object.entries(songsData)) {
+      if (value) {
+        const song = JSON.parse(value);
+        songs.push({
+          platform: song.platform,
+          id: song.id,
+          name: song.name,
+          artist: song.artist,
+          album: song.album || undefined,
+          pic: song.pic || undefined,
+          duration: parseFloat(song.duration),
+          added_at: parseInt(song.added_at, 10),
+        });
+      }
+    }
+
+    // 按添加时间排序
+    return songs.sort((a, b) => a.added_at - b.added_at);
+  }
+
+  async isSongInPlaylist(
+    playlistId: string,
+    platform: string,
+    songId: string
+  ): Promise<boolean> {
+    const songKey = `${platform}+${songId}`;
+    const exists = await this.withRetry(() =>
+      this.adapter.hGet(this.musicPlaylistSongsKey(playlistId), songKey)
+    );
+    return exists !== null;
+  }
+
+  // ---------- Music V2 历史记录 ----------
+  private musicV2HistoryKey(userName: string) {
+    return `u:${userName}:music:v2:history`;
+  }
+
+  async listMusicV2History(userName: string): Promise<MusicV2HistoryRecord[]> {
+    const rows = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicV2HistoryKey(userName))
+    );
+
+    // 按队列顺序返回（sortOrder 优先，遗留记录回退到 createdAt）；
+    // 当前播放项由最大 lastPlayedAt 决定，不参与排序。
+    return sortMusicV2History(
+      Object.values(rows || {})
+        .filter(Boolean)
+        .map((value) => JSON.parse(value as string) as MusicV2HistoryRecord)
+    );
+  }
+
+  async upsertMusicV2History(
+    userName: string,
+    record: MusicV2HistoryRecord
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.musicV2HistoryKey(userName),
+        record.songId,
+        JSON.stringify(record)
+      )
+    );
+  }
+
+  async batchUpsertMusicV2History(
+    userName: string,
+    records: MusicV2HistoryRecord[]
+  ): Promise<void> {
+    if (!records.length) return;
+    const payload: Record<string, string> = {};
+    for (const record of records) {
+      payload[record.songId] = JSON.stringify(record);
+    }
+    await this.withRetry(() =>
+      this.adapter.hSet(this.musicV2HistoryKey(userName), payload)
+    );
+  }
+
+  async deleteMusicV2History(userName: string, songId: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.musicV2HistoryKey(userName), songId)
+    );
+  }
+
+  async clearMusicV2History(userName: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.del(this.musicV2HistoryKey(userName))
+    );
+  }
+
+  // ---------- Music V2 歌单 ----------
+  private musicV2PlaylistsKey(userName: string) {
+    return `u:${userName}:music:v2:playlists`;
+  }
+
+  private musicV2PlaylistKey(playlistId: string) {
+    return `music:v2:playlist:${playlistId}`;
+  }
+
+  private musicV2PlaylistItemsKey(playlistId: string) {
+    return `music:v2:playlist:${playlistId}:items`;
+  }
+
+  async createMusicV2Playlist(
+    userName: string,
+    playlist: {
+      id: string;
+      name: string;
+      description?: string;
+      cover?: string;
+    }
+  ): Promise<void> {
+    const now = Date.now();
+    const payload = {
+      id: playlist.id,
+      username: userName,
+      name: playlist.name,
+      description: playlist.description || '',
+      cover: playlist.cover || '',
+      song_count: '0',
+      created_at: now.toString(),
+      updated_at: now.toString(),
+    };
+
+    await this.withRetry(() =>
+      this.adapter.hSet(this.musicV2PlaylistKey(playlist.id), payload)
+    );
+    await this.withRetry(() =>
+      this.adapter.zAdd(this.musicV2PlaylistsKey(userName), {
+        score: now,
+        value: playlist.id,
+      })
+    );
+  }
+
+  async getMusicV2Playlist(
+    playlistId: string
+  ): Promise<MusicV2PlaylistRecord | null> {
+    const data = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicV2PlaylistKey(playlistId))
+    );
+    if (!data || Object.keys(data).length === 0) return null;
+    return {
+      id: data.id,
+      username: data.username,
+      name: data.name,
+      description: data.description || undefined,
+      cover: data.cover || undefined,
+      song_count: parseInt(data.song_count || '0', 10) || 0,
+      created_at: parseInt(data.created_at, 10),
+      updated_at: parseInt(data.updated_at, 10),
+    };
+  }
+
+  async listMusicV2Playlists(
+    userName: string
+  ): Promise<MusicV2PlaylistRecord[]> {
+    const playlistIds = await this.withRetry(() =>
+      this.adapter.zRange(this.musicV2PlaylistsKey(userName), 0, -1)
+    );
+    const playlists: MusicV2PlaylistRecord[] = [];
+    for (const playlistId of playlistIds || []) {
+      const playlist = await this.getMusicV2Playlist(ensureString(playlistId));
+      if (playlist) playlists.push(playlist);
+    }
+    return playlists.sort((a, b) => b.updated_at - a.updated_at);
+  }
+
+  async updateMusicV2Playlist(
+    playlistId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      cover?: string;
+      song_count?: number;
+    }
+  ): Promise<void> {
+    const payload: Record<string, string> = {
+      updated_at: Date.now().toString(),
+    };
+    if (updates.name !== undefined) payload.name = updates.name;
+    if (updates.description !== undefined)
+      payload.description = updates.description || '';
+    if (updates.cover !== undefined) payload.cover = updates.cover || '';
+    if (updates.song_count !== undefined)
+      payload.song_count = String(updates.song_count);
+    await this.withRetry(() =>
+      this.adapter.hSet(this.musicV2PlaylistKey(playlistId), payload)
+    );
+  }
+
+  async deleteMusicV2Playlist(playlistId: string): Promise<void> {
+    const playlist = await this.getMusicV2Playlist(playlistId);
+    if (!playlist) return;
+    await this.withRetry(() =>
+      this.adapter.zRem(this.musicV2PlaylistsKey(playlist.username), playlistId)
+    );
+    await this.withRetry(() =>
+      this.adapter.del(this.musicV2PlaylistKey(playlistId))
+    );
+    await this.withRetry(() =>
+      this.adapter.del(this.musicV2PlaylistItemsKey(playlistId))
+    );
+  }
+
+  async addMusicV2PlaylistItem(
+    playlistId: string,
+    item: MusicV2PlaylistItem
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.musicV2PlaylistItemsKey(playlistId),
+        item.songId,
+        JSON.stringify(item)
+      )
+    );
+    const items = await this.listMusicV2PlaylistItems(playlistId);
+    const playlist = await this.getMusicV2Playlist(playlistId);
+    await this.updateMusicV2Playlist(playlistId, {
+      song_count: items.length,
+      cover: playlist?.cover || item.cover,
+    });
+  }
+
+  async removeMusicV2PlaylistItem(
+    playlistId: string,
+    songId: string
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.musicV2PlaylistItemsKey(playlistId), songId)
+    );
+    const items = await this.listMusicV2PlaylistItems(playlistId);
+    await this.updateMusicV2Playlist(playlistId, {
+      song_count: items.length,
+      cover: items[0]?.cover || '',
+    });
+  }
+
+  async listMusicV2PlaylistItems(
+    playlistId: string
+  ): Promise<MusicV2PlaylistItem[]> {
+    const rows = await this.withRetry(() =>
+      this.adapter.hGetAll(this.musicV2PlaylistItemsKey(playlistId))
+    );
+    return Object.values(rows || {})
+      .filter(Boolean)
+      .map((value) => JSON.parse(value as string) as MusicV2PlaylistItem)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.addedAt - b.addedAt);
+  }
+
+  async hasMusicV2PlaylistItem(
+    playlistId: string,
+    songId: string
+  ): Promise<boolean> {
+    const exists = await this.withRetry(() =>
+      this.adapter.hGet(this.musicV2PlaylistItemsKey(playlistId), songId)
+    );
+    return exists !== null;
+  }
+
   // ---------- 用户注册 / 登录（旧版本，保持兼容） ----------
   private userPwdKey(user: string) {
     return `u:${user}:pwd`;
@@ -494,7 +986,7 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
     const stored = await this.withRetry(() =>
-      this.client.get(this.userPwdKey(userName))
+      this.adapter.get(this.userPwdKey(userName))
     );
     if (stored === null) return false;
     // 确保比较时都是字符串类型
@@ -505,7 +997,7 @@ export abstract class BaseRedisStorage implements IStorage {
   async checkUserExist(userName: string): Promise<boolean> {
     // 使用 EXISTS 判断 key 是否存在
     const exists = await this.withRetry(() =>
-      this.client.exists(this.userPwdKey(userName))
+      this.adapter.exists(this.userPwdKey(userName))
     );
     return exists === 1;
   }
@@ -514,53 +1006,110 @@ export abstract class BaseRedisStorage implements IStorage {
   async changePassword(userName: string, newPassword: string): Promise<void> {
     // 简单存储明文密码，生产环境应加密
     await this.withRetry(() =>
-      this.client.set(this.userPwdKey(userName), newPassword)
+      this.adapter.set(this.userPwdKey(userName), newPassword)
     );
   }
 
   // 删除用户及其所有数据
   async deleteUser(userName: string): Promise<void> {
     // 删除用户密码
-    await this.withRetry(() => this.client.del(this.userPwdKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.userPwdKey(userName)));
 
     // 删除搜索历史
-    await this.withRetry(() => this.client.del(this.shKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.shKey(userName)));
 
     // 删除播放记录（新hash结构）
-    await this.withRetry(() => this.client.del(this.prHashKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.prHashKey(userName)));
 
     // 删除旧的播放记录key（如果有）
     const playRecordPattern = `u:${userName}:pr:*`;
     const playRecordKeys = await this.withRetry(() =>
-      this.client.keys(playRecordPattern)
+      this.adapter.keys(playRecordPattern)
     );
     if (playRecordKeys.length > 0) {
-      await this.withRetry(() => this.client.del(playRecordKeys));
+      await this.withRetry(() => this.adapter.del(playRecordKeys));
     }
 
     // 删除收藏夹（新hash结构）
-    await this.withRetry(() => this.client.del(this.favHashKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.favHashKey(userName)));
+
+    // 删除漫画书架与历史
+    await this.withRetry(() =>
+      this.adapter.del(this.mangaShelfHashKey(userName))
+    );
+    await this.withRetry(() =>
+      this.adapter.del(this.mangaReadHashKey(userName))
+    );
 
     // 删除旧的收藏key（如果有）
     const favoritePattern = `u:${userName}:fav:*`;
     const favoriteKeys = await this.withRetry(() =>
-      this.client.keys(favoritePattern)
+      this.adapter.keys(favoritePattern)
     );
     if (favoriteKeys.length > 0) {
-      await this.withRetry(() => this.client.del(favoriteKeys));
+      await this.withRetry(() => this.adapter.del(favoriteKeys));
     }
 
     // 删除跳过片头片尾配置（新hash结构）
-    await this.withRetry(() => this.client.del(this.skipHashKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.skipHashKey(userName)));
 
     // 删除旧的跳过配置key（如果有）
     const skipConfigPattern = `u:${userName}:skip:*`;
     const skipConfigKeys = await this.withRetry(() =>
-      this.client.keys(skipConfigPattern)
+      this.adapter.keys(skipConfigPattern)
     );
     if (skipConfigKeys.length > 0) {
-      await this.withRetry(() => this.client.del(skipConfigKeys));
+      await this.withRetry(() => this.adapter.del(skipConfigKeys));
     }
+
+    // 删除音乐播放记录
+    await this.withRetry(() =>
+      this.adapter.del(this.musicPlayRecordHashKey(userName))
+    );
+
+    // 删除用户的所有歌单
+    const playlistIds = await this.withRetry(() =>
+      this.adapter.zRange(this.musicPlaylistsKey(userName), 0, -1)
+    );
+    if (playlistIds && playlistIds.length > 0) {
+      for (const playlistId of playlistIds) {
+        const id = ensureString(playlistId);
+        // 删除歌单信息
+        await this.withRetry(() => this.adapter.del(this.musicPlaylistKey(id)));
+        // 删除歌单的歌曲列表
+        await this.withRetry(() =>
+          this.adapter.del(this.musicPlaylistSongsKey(id))
+        );
+      }
+    }
+    // 删除用户的歌单列表
+    await this.withRetry(() =>
+      this.adapter.del(this.musicPlaylistsKey(userName))
+    );
+
+    // 删除音乐 V2 播放记录
+    await this.withRetry(() =>
+      this.adapter.del(this.musicV2HistoryKey(userName))
+    );
+
+    // 删除音乐 V2 歌单
+    const musicV2PlaylistIds = await this.withRetry(() =>
+      this.adapter.zRange(this.musicV2PlaylistsKey(userName), 0, -1)
+    );
+    if (musicV2PlaylistIds && musicV2PlaylistIds.length > 0) {
+      for (const playlistId of musicV2PlaylistIds) {
+        const id = ensureString(playlistId);
+        await this.withRetry(() =>
+          this.adapter.del(this.musicV2PlaylistKey(id))
+        );
+        await this.withRetry(() =>
+          this.adapter.del(this.musicV2PlaylistItemsKey(id))
+        );
+      }
+    }
+    await this.withRetry(() =>
+      this.adapter.del(this.musicV2PlaylistsKey(userName))
+    );
   }
 
   // ---------- 新版用户存储（使用Hash和Sorted Set） ----------
@@ -582,7 +1131,7 @@ export abstract class BaseRedisStorage implements IStorage {
     const data = encoder.encode(password);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
   // 创建新用户（新版本）
@@ -616,16 +1165,25 @@ export abstract class BaseRedisStorage implements IStorage {
     if (oidcSub) {
       userInfo.oidcSub = oidcSub;
       // 创建OIDC映射
-      await this.withRetry(() => this.client.set(this.oidcSubKey(oidcSub), userName));
+      await this.withRetry(() =>
+        this.adapter.set(this.oidcSubKey(oidcSub), userName)
+      );
     }
 
-    await this.withRetry(() => this.client.hSet(this.userInfoKey(userName), userInfo));
+    await this.withRetry(() =>
+      this.adapter.hSet(this.userInfoKey(userName), userInfo)
+    );
 
     // 添加到用户列表（Sorted Set，按注册时间排序）
-    await this.withRetry(() => this.client.zAdd(this.userListKey(), {
-      score: createdAt,
-      value: userName,
-    }));
+    await this.withRetry(() =>
+      this.adapter.zAdd(this.userListKey(), {
+        score: createdAt,
+        value: userName,
+      })
+    );
+
+    // 清除用户信息缓存
+    userInfoCache?.delete(userName);
 
     // 如果创建的是站长用户，清除站长存在状态缓存
     if (userName === process.env.USERNAME) {
@@ -637,7 +1195,7 @@ export abstract class BaseRedisStorage implements IStorage {
   // 验证用户密码（新版本）
   async verifyUserV2(userName: string, password: string): Promise<boolean> {
     const userInfo = await this.withRetry(() =>
-      this.client.hGetAll(this.userInfoKey(userName))
+      this.adapter.hGetAll(this.userInfoKey(userName))
     );
 
     if (!userInfo || !userInfo.password) {
@@ -659,26 +1217,97 @@ export abstract class BaseRedisStorage implements IStorage {
     playrecord_migrated?: boolean;
     favorite_migrated?: boolean;
     skip_migrated?: boolean;
+    last_movie_request_time?: number;
+    email?: string;
+    emailNotifications?: boolean;
   } | null> {
-    const userInfo = await this.withRetry(() =>
-      this.client.hGetAll(this.userInfoKey(userName))
+    // 先从缓存获取
+    const cached = userInfoCache?.get(userName);
+    if (cached) {
+      return cached;
+    }
+
+    const userInfoRaw = await this.withRetry(() =>
+      this.adapter.hGetAll(this.userInfoKey(userName))
     );
 
-    if (!userInfo || Object.keys(userInfo).length === 0) {
+    if (!userInfoRaw || Object.keys(userInfoRaw).length === 0) {
+      // 如果数据库中没有，检查是否是环境变量中的站长
+      if (userName === process.env.USERNAME) {
+        // 站长即使数据库没有数据，也返回默认信息
+        const ownerInfo = {
+          role: 'owner' as const,
+          banned: false,
+          created_at: Date.now(),
+          playrecord_migrated: true,
+          favorite_migrated: true,
+          skip_migrated: true,
+        };
+
+        // 为站长创建数据库记录
+        try {
+          const userInfo: Record<string, string> = {
+            role: 'owner',
+            banned: 'false',
+            created_at: ownerInfo.created_at.toString(),
+            playrecord_migrated: 'true',
+            favorite_migrated: 'true',
+            skip_migrated: 'true',
+          };
+
+          await this.withRetry(() =>
+            this.adapter.hSet(this.userInfoKey(userName), userInfo)
+          );
+
+          // 添加到用户列表（Sorted Set，按注册时间排序）
+          await this.withRetry(() =>
+            this.adapter.zAdd(this.userListKey(), {
+              score: ownerInfo.created_at,
+              value: userName,
+            })
+          );
+
+          console.log(`Created database record for site owner: ${userName}`);
+        } catch (insertErr) {
+          console.error('Failed to create owner record:', insertErr);
+          // 即使插入失败，仍然返回默认信息
+        }
+
+        // 缓存站长信息
+        userInfoCache?.set(userName, ownerInfo);
+        return ownerInfo;
+      }
       return null;
     }
 
-    return {
-      role: (userInfo.role as 'owner' | 'admin' | 'user') || 'user',
-      banned: userInfo.banned === 'true',
-      tags: userInfo.tags ? JSON.parse(userInfo.tags) : undefined,
-      oidcSub: userInfo.oidcSub,
-      enabledApis: userInfo.enabledApis ? JSON.parse(userInfo.enabledApis) : undefined,
-      created_at: parseInt(userInfo.created_at || '0', 10),
-      playrecord_migrated: userInfo.playrecord_migrated === 'true',
-      favorite_migrated: userInfo.favorite_migrated === 'true',
-      skip_migrated: userInfo.skip_migrated === 'true',
+    const userInfo = {
+      role: (userInfoRaw.role as 'owner' | 'admin' | 'user') || 'user',
+      banned: userInfoRaw.banned === 'true',
+      tags: userInfoRaw.tags ? JSON.parse(userInfoRaw.tags) : undefined,
+      oidcSub: userInfoRaw.oidcSub,
+      enabledApis: userInfoRaw.enabledApis
+        ? JSON.parse(userInfoRaw.enabledApis)
+        : undefined,
+      created_at: parseInt(userInfoRaw.created_at || '0', 10),
+      playrecord_migrated: userInfoRaw.playrecord_migrated === 'true',
+      favorite_migrated: userInfoRaw.favorite_migrated === 'true',
+      skip_migrated: userInfoRaw.skip_migrated === 'true',
+      last_movie_request_time: userInfoRaw.last_movie_request_time
+        ? parseInt(userInfoRaw.last_movie_request_time, 10)
+        : undefined,
+      email: userInfoRaw.email,
+      emailNotifications: userInfoRaw.emailNotifications === 'true',
     };
+
+    // 如果是站长，强制将 role 设置为 owner
+    if (userName === process.env.USERNAME) {
+      userInfo.role = 'owner';
+    }
+
+    // 写入缓存
+    userInfoCache?.set(userName, userInfo);
+
+    return userInfo;
   }
 
   // 更新用户信息（新版本）
@@ -707,7 +1336,9 @@ export abstract class BaseRedisStorage implements IStorage {
         userInfo.tags = JSON.stringify(updates.tags);
       } else {
         // 删除tags字段
-        await this.withRetry(() => this.client.hDel(this.userInfoKey(userName), 'tags'));
+        await this.withRetry(() =>
+          this.adapter.hDel(this.userInfoKey(userName), 'tags')
+        );
       }
     }
 
@@ -716,7 +1347,9 @@ export abstract class BaseRedisStorage implements IStorage {
         userInfo.enabledApis = JSON.stringify(updates.enabledApis);
       } else {
         // 删除enabledApis字段
-        await this.withRetry(() => this.client.hDel(this.userInfoKey(userName), 'enabledApis'));
+        await this.withRetry(() =>
+          this.adapter.hDel(this.userInfoKey(userName), 'enabledApis')
+        );
       }
     }
 
@@ -724,30 +1357,42 @@ export abstract class BaseRedisStorage implements IStorage {
       const oldInfo = await this.getUserInfoV2(userName);
       if (oldInfo?.oidcSub && oldInfo.oidcSub !== updates.oidcSub) {
         // 删除旧的OIDC映射
-        await this.withRetry(() => this.client.del(this.oidcSubKey(oldInfo.oidcSub!)));
+        await this.withRetry(() =>
+          this.adapter.del(this.oidcSubKey(oldInfo.oidcSub!))
+        );
       }
       userInfo.oidcSub = updates.oidcSub;
       // 创建新的OIDC映射
-      await this.withRetry(() => this.client.set(this.oidcSubKey(updates.oidcSub!), userName));
+      await this.withRetry(() =>
+        this.adapter.set(this.oidcSubKey(updates.oidcSub!), userName)
+      );
     }
 
     if (Object.keys(userInfo).length > 0) {
-      await this.withRetry(() => this.client.hSet(this.userInfoKey(userName), userInfo));
+      await this.withRetry(() =>
+        this.adapter.hSet(this.userInfoKey(userName), userInfo)
+      );
     }
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
   }
 
   // 修改用户密码（新版本）
   async changePasswordV2(userName: string, newPassword: string): Promise<void> {
     const hashedPassword = await this.hashPassword(newPassword);
     await this.withRetry(() =>
-      this.client.hSet(this.userInfoKey(userName), 'password', hashedPassword)
+      this.adapter.hSet(this.userInfoKey(userName), 'password', hashedPassword)
     );
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
   }
 
   // 检查用户是否存在（新版本）
   async checkUserExistV2(userName: string): Promise<boolean> {
     const exists = await this.withRetry(() =>
-      this.client.exists(this.userInfoKey(userName))
+      this.adapter.exists(this.userInfoKey(userName))
     );
     return exists === 1;
   }
@@ -755,16 +1400,17 @@ export abstract class BaseRedisStorage implements IStorage {
   // 通过OIDC Sub查找用户名
   async getUserByOidcSub(oidcSub: string): Promise<string | null> {
     const userName = await this.withRetry(() =>
-      this.client.get(this.oidcSubKey(oidcSub))
+      this.adapter.get(this.oidcSubKey(oidcSub))
     );
     return userName ? ensureString(userName) : null;
   }
 
   // 获取用户列表（分页，新版本）
   async getUserListV2(
-    offset: number = 0,
-    limit: number = 20,
-    ownerUsername?: string
+    offset = 0,
+    limit = 20,
+    ownerUsername?: string,
+    search?: string
   ): Promise<{
     users: Array<{
       username: string;
@@ -777,8 +1423,12 @@ export abstract class BaseRedisStorage implements IStorage {
     }>;
     total: number;
   }> {
+    const trimmedSearch = search?.trim() || '';
+
     // 获取总数
-    let total = await this.withRetry(() => this.client.zCard(this.userListKey()));
+    let total = await this.withRetry(() =>
+      this.adapter.zCard(this.userListKey())
+    );
 
     // 检查站长是否在数据库中（使用缓存）
     let ownerInfo = null;
@@ -803,8 +1453,11 @@ export abstract class BaseRedisStorage implements IStorage {
         ownerExistenceCache.set(ownerUsername, ownerInDatabase);
       }
 
-      // 如果站长不在数据库中，总数+1（无论在哪一页都要加）
-      if (!ownerInDatabase) {
+      // 如果站长不在数据库中且匹配搜索条件，总数+1（无论在哪一页都要加）
+      if (
+        !ownerInDatabase &&
+        (!trimmedSearch || ownerUsername.includes(trimmedSearch))
+      ) {
         total += 1;
       }
     }
@@ -813,7 +1466,11 @@ export abstract class BaseRedisStorage implements IStorage {
     let actualOffset = offset;
     let actualLimit = limit;
 
-    if (ownerUsername && !ownerInDatabase) {
+    if (
+      ownerUsername &&
+      !ownerInDatabase &&
+      (!trimmedSearch || ownerUsername.includes(trimmedSearch))
+    ) {
       if (offset === 0) {
         // 第一页：只获取 limit-1 个用户，为站长留出位置
         actualLimit = limit - 1;
@@ -824,20 +1481,46 @@ export abstract class BaseRedisStorage implements IStorage {
     }
 
     // 获取用户列表（按注册时间升序）
-    const usernames = await this.withRetry(() =>
-      this.client.zRange(this.userListKey(), actualOffset, actualOffset + actualLimit - 1)
+    let usernames = await this.withRetry(() =>
+      trimmedSearch
+        ? this.adapter.zRange(this.userListKey(), 0, -1)
+        : this.adapter.zRange(
+            this.userListKey(),
+            actualOffset,
+            actualOffset + actualLimit - 1
+          )
     );
+    if (trimmedSearch) {
+      usernames = usernames.filter((username) =>
+        ensureString(username).includes(trimmedSearch)
+      );
+      total = usernames.length;
+      if (
+        ownerUsername &&
+        !ownerInDatabase &&
+        ownerUsername.includes(trimmedSearch)
+      ) {
+        total += 1;
+      }
+      usernames = usernames.slice(actualOffset, actualOffset + actualLimit);
+    }
 
     const users = [];
 
     // 如果有站长且在第一页，确保站长始终在第一位
-    if (ownerUsername && offset === 0) {
+    if (
+      ownerUsername &&
+      offset === 0 &&
+      (!trimmedSearch || ownerUsername.includes(trimmedSearch))
+    ) {
       // 即使站长不在数据库中，也要添加站长（站长使用环境变量认证）
       users.push({
         username: ownerUsername,
         role: 'owner' as const,
         banned: ownerInfo?.banned || false,
         tags: ownerInfo?.tags,
+        oidcSub: ownerInfo?.oidcSub,
+        enabledApis: ownerInfo?.enabledApis,
         created_at: ownerInfo?.created_at || 0,
       });
     }
@@ -857,6 +1540,8 @@ export abstract class BaseRedisStorage implements IStorage {
           role: userInfo.role,
           banned: userInfo.banned,
           tags: userInfo.tags,
+          oidcSub: userInfo.oidcSub,
+          enabledApis: userInfo.enabledApis,
           created_at: userInfo.created_at,
         });
       }
@@ -872,17 +1557,25 @@ export abstract class BaseRedisStorage implements IStorage {
 
     // 删除OIDC映射
     if (userInfo?.oidcSub) {
-      await this.withRetry(() => this.client.del(this.oidcSubKey(userInfo.oidcSub!)));
+      await this.withRetry(() =>
+        this.adapter.del(this.oidcSubKey(userInfo.oidcSub!))
+      );
     }
 
     // 删除用户信息Hash
-    await this.withRetry(() => this.client.del(this.userInfoKey(userName)));
+    await this.withRetry(() => this.adapter.del(this.userInfoKey(userName)));
 
     // 从用���列表中移除
-    await this.withRetry(() => this.client.zRem(this.userListKey(), userName));
+    await this.withRetry(() => this.adapter.zRem(this.userListKey(), userName));
+
+    // 删除用户的本地设置云同步副本
+    await this.withRetry(() => this.adapter.del(this.settingsSyncKey(userName)));
 
     // 删除用户的其他数据（播放记录、收藏等）
     await this.deleteUser(userName);
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
   }
 
   // ---------- 搜索历史 ----------
@@ -892,7 +1585,7 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async getSearchHistory(userName: string): Promise<string[]> {
     const result = await this.withRetry(() =>
-      this.client.lRange(this.shKey(userName), 0, -1)
+      this.adapter.lRange(this.shKey(userName), 0, -1)
     );
     // 确保返回的都是字符串类型
     return ensureStringArray(result as any[]);
@@ -901,19 +1594,257 @@ export abstract class BaseRedisStorage implements IStorage {
   async addSearchHistory(userName: string, keyword: string): Promise<void> {
     const key = this.shKey(userName);
     // 先去重
-    await this.withRetry(() => this.client.lRem(key, 0, ensureString(keyword)));
+    await this.withRetry(() =>
+      this.adapter.lRem(key, 0, ensureString(keyword))
+    );
     // 插入到最前
-    await this.withRetry(() => this.client.lPush(key, ensureString(keyword)));
+    await this.withRetry(() => this.adapter.lPush(key, ensureString(keyword)));
     // 限制最大长度
-    await this.withRetry(() => this.client.lTrim(key, 0, SEARCH_HISTORY_LIMIT - 1));
+    await this.withRetry(() =>
+      this.adapter.lTrim(key, 0, SEARCH_HISTORY_LIMIT - 1)
+    );
   }
 
   async deleteSearchHistory(userName: string, keyword?: string): Promise<void> {
     const key = this.shKey(userName);
     if (keyword) {
-      await this.withRetry(() => this.client.lRem(key, 0, ensureString(keyword)));
+      await this.withRetry(() =>
+        this.adapter.lRem(key, 0, ensureString(keyword))
+      );
     } else {
-      await this.withRetry(() => this.client.del(key));
+      await this.withRetry(() => this.adapter.del(key));
+    }
+  }
+
+  // ---------- 漫画书架 ----------
+  private mangaShelfHashKey(user: string) {
+    return `u:${user}:manga:shelf`;
+  }
+
+  async getMangaShelf(
+    userName: string,
+    key: string
+  ): Promise<MangaShelfItem | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.hGet(this.mangaShelfHashKey(userName), key)
+    );
+    return val ? (JSON.parse(val) as MangaShelfItem) : null;
+  }
+
+  async setMangaShelf(
+    userName: string,
+    key: string,
+    item: MangaShelfItem
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.mangaShelfHashKey(userName),
+        key,
+        JSON.stringify(item)
+      )
+    );
+  }
+
+  async getAllMangaShelf(
+    userName: string
+  ): Promise<Record<string, MangaShelfItem>> {
+    const hashData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.mangaShelfHashKey(userName))
+    );
+    const result: Record<string, MangaShelfItem> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) result[key] = JSON.parse(value) as MangaShelfItem;
+    }
+    return result;
+  }
+
+  async deleteMangaShelf(userName: string, key: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.mangaShelfHashKey(userName), key)
+    );
+  }
+
+  // ---------- 漫画阅读历史 ----------
+  private mangaReadHashKey(user: string) {
+    return `u:${user}:manga:history`;
+  }
+
+  async getMangaReadRecord(
+    userName: string,
+    key: string
+  ): Promise<MangaReadRecord | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.hGet(this.mangaReadHashKey(userName), key)
+    );
+    return val ? (JSON.parse(val) as MangaReadRecord) : null;
+  }
+
+  async setMangaReadRecord(
+    userName: string,
+    key: string,
+    record: MangaReadRecord
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.mangaReadHashKey(userName),
+        key,
+        JSON.stringify(record)
+      )
+    );
+  }
+
+  async getAllMangaReadRecords(
+    userName: string
+  ): Promise<Record<string, MangaReadRecord>> {
+    const hashData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.mangaReadHashKey(userName))
+    );
+    const result: Record<string, MangaReadRecord> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) result[key] = JSON.parse(value) as MangaReadRecord;
+    }
+    return result;
+  }
+
+  async deleteMangaReadRecord(userName: string, key: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.mangaReadHashKey(userName), key)
+    );
+  }
+
+  async cleanupOldMangaReadRecords(userName: string): Promise<void> {
+    const records = await this.getAllMangaReadRecords(userName);
+    const maxRecords = parseInt(
+      process.env.MAX_MANGA_HISTORY_PER_USER || '100',
+      10
+    );
+    const threshold = maxRecords + 10;
+    if (Object.keys(records).length <= threshold) return;
+    const keys = Object.entries(records)
+      .sort(([, a], [, b]) => b.saveTime - a.saveTime)
+      .slice(maxRecords)
+      .map(([key]) => key);
+
+    if (keys.length > 0) {
+      await this.withRetry(() =>
+        this.adapter.hDel(this.mangaReadHashKey(userName), ...keys)
+      );
+    }
+  }
+
+  // ---------- 电子书书架 ----------
+  private bookShelfHashKey(user: string) {
+    return `u:${user}:book:shelf`;
+  }
+
+  async getBookShelf(
+    userName: string,
+    key: string
+  ): Promise<BookShelfItem | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.hGet(this.bookShelfHashKey(userName), key)
+    );
+    return val ? (JSON.parse(val) as BookShelfItem) : null;
+  }
+
+  async setBookShelf(
+    userName: string,
+    key: string,
+    item: BookShelfItem
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.bookShelfHashKey(userName),
+        key,
+        JSON.stringify(item)
+      )
+    );
+  }
+
+  async getAllBookShelf(
+    userName: string
+  ): Promise<Record<string, BookShelfItem>> {
+    const hashData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.bookShelfHashKey(userName))
+    );
+    const result: Record<string, BookShelfItem> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) result[key] = JSON.parse(value) as BookShelfItem;
+    }
+    return result;
+  }
+
+  async deleteBookShelf(userName: string, key: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.bookShelfHashKey(userName), key)
+    );
+  }
+
+  // ---------- 电子书阅读历史 ----------
+  private bookReadHashKey(user: string) {
+    return `u:${user}:book:history`;
+  }
+
+  async getBookReadRecord(
+    userName: string,
+    key: string
+  ): Promise<BookReadRecord | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.hGet(this.bookReadHashKey(userName), key)
+    );
+    return val ? (JSON.parse(val) as BookReadRecord) : null;
+  }
+
+  async setBookReadRecord(
+    userName: string,
+    key: string,
+    record: BookReadRecord
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.bookReadHashKey(userName),
+        key,
+        JSON.stringify(record)
+      )
+    );
+  }
+
+  async getAllBookReadRecords(
+    userName: string
+  ): Promise<Record<string, BookReadRecord>> {
+    const hashData = await this.withRetry(() =>
+      this.adapter.hGetAll(this.bookReadHashKey(userName))
+    );
+    const result: Record<string, BookReadRecord> = {};
+    for (const [key, value] of Object.entries(hashData)) {
+      if (value) result[key] = JSON.parse(value) as BookReadRecord;
+    }
+    return result;
+  }
+
+  async deleteBookReadRecord(userName: string, key: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.bookReadHashKey(userName), key)
+    );
+  }
+
+  async cleanupOldBookReadRecords(userName: string): Promise<void> {
+    const records = await this.getAllBookReadRecords(userName);
+    const maxRecords = parseInt(
+      process.env.MAX_BOOK_HISTORY_PER_USER || '100',
+      10
+    );
+    const threshold = maxRecords + 10;
+    if (Object.keys(records).length <= threshold) return;
+    const keys = Object.entries(records)
+      .sort(([, a], [, b]) => b.saveTime - a.saveTime)
+      .slice(maxRecords)
+      .map(([key]) => key);
+
+    if (keys.length > 0) {
+      await this.withRetry(() =>
+        this.adapter.hDel(this.bookReadHashKey(userName), ...keys)
+      );
     }
   }
 
@@ -922,9 +1853,9 @@ export abstract class BaseRedisStorage implements IStorage {
     // 从新版用户列表获取
     const userListKey = this.userListKey();
     const users = await this.withRetry(() =>
-      this.client.zRange(userListKey, 0, -1)
+      this.adapter.zRange(userListKey, 0, -1)
     );
-    const userList = users.map(u => ensureString(u));
+    const userList = users.map((u) => ensureString(u));
 
     // 确保站长在列表中（站长可能不在数据库中，使用环境变量认证）
     const ownerUsername = process.env.USERNAME;
@@ -941,14 +1872,77 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async getAdminConfig(): Promise<AdminConfig | null> {
-    const val = await this.withRetry(() => this.client.get(this.adminConfigKey()));
+    const val = await this.withRetry(() =>
+      this.adapter.get(this.adminConfigKey())
+    );
     return val ? (JSON.parse(val) as AdminConfig) : null;
   }
 
   async setAdminConfig(config: AdminConfig): Promise<void> {
     await this.withRetry(() =>
-      this.client.set(this.adminConfigKey(), JSON.stringify(config))
+      this.adapter.set(this.adminConfigKey(), JSON.stringify(config))
     );
+  }
+
+  // ---------- 本地设置云同步 ----------
+  // 使用单个 String key 存完整快照文档（单副本、覆盖式），字段与关系型表逐列对应
+  private settingsSyncKey(user: string) {
+    return `u:${user}:settings_sync`;
+  }
+
+  async getUserLocalSettings(
+    userName: string
+  ): Promise<LocalSettingsSyncRecord | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.get(this.settingsSyncKey(userName))
+    );
+    if (!val) return null;
+    try {
+      const parsed = JSON.parse(val) as LocalSettingsSyncRecord;
+      return {
+        payload: String(parsed.payload ?? ''),
+        payloadMd5: String(parsed.payloadMd5 ?? ''),
+        payloadSize: Number(parsed.payloadSize) || 0,
+        version: Number(parsed.version) || 0,
+        updatedAt: Number(parsed.updatedAt) || 0,
+      };
+    } catch (err) {
+      console.error('getUserLocalSettings parse error:', err);
+      return null;
+    }
+  }
+
+  async setUserLocalSettings(
+    userName: string,
+    payload: string,
+    opts: SetLocalSettingsSyncOptions
+  ): Promise<SetLocalSettingsSyncResult> {
+    const key = this.settingsSyncKey(userName);
+    const now = Date.now();
+    let version = 1;
+
+    // 乐观锁：仅当期望版本匹配时才覆盖（无 expectedVersion 时无条件覆盖）
+    if (opts.expectedVersion !== undefined) {
+      const current = await this.getUserLocalSettings(userName);
+      if (current && current.version !== opts.expectedVersion) {
+        return { ok: false, version: current.version, updatedAt: current.updatedAt };
+      }
+      version = current ? current.version + 1 : 1;
+    } else {
+      const current = await this.getUserLocalSettings(userName);
+      version = current ? current.version + 1 : 1;
+    }
+
+    const doc: LocalSettingsSyncRecord = {
+      payload,
+      payloadMd5: opts.payloadMd5,
+      payloadSize: opts.payloadSize,
+      version,
+      updatedAt: now,
+    };
+
+    await this.withRetry(() => this.adapter.set(key, JSON.stringify(doc)));
+    return { ok: true, version, updatedAt: now };
   }
 
   // ---------- 跳过片头片尾配置 ----------
@@ -967,7 +1961,7 @@ export abstract class BaseRedisStorage implements IStorage {
   ): Promise<SkipConfig | null> {
     const key = `${source}+${id}`;
     const val = await this.withRetry(() =>
-      this.client.hGet(this.skipHashKey(userName), key)
+      this.adapter.hGet(this.skipHashKey(userName), key)
     );
     return val ? (JSON.parse(val) as SkipConfig) : null;
   }
@@ -980,7 +1974,7 @@ export abstract class BaseRedisStorage implements IStorage {
   ): Promise<void> {
     const key = `${source}+${id}`;
     await this.withRetry(() =>
-      this.client.hSet(this.skipHashKey(userName), key, JSON.stringify(config))
+      this.adapter.hSet(this.skipHashKey(userName), key, JSON.stringify(config))
     );
   }
 
@@ -991,7 +1985,7 @@ export abstract class BaseRedisStorage implements IStorage {
   ): Promise<void> {
     const key = `${source}+${id}`;
     await this.withRetry(() =>
-      this.client.hDel(this.skipHashKey(userName), key)
+      this.adapter.hDel(this.skipHashKey(userName), key)
     );
   }
 
@@ -999,7 +1993,7 @@ export abstract class BaseRedisStorage implements IStorage {
     userName: string
   ): Promise<{ [key: string]: SkipConfig }> {
     const hashData = await this.withRetry(() =>
-      this.client.hGetAll(this.skipHashKey(userName))
+      this.adapter.hGetAll(this.skipHashKey(userName))
     );
 
     const result: Record<string, SkipConfig> = {};
@@ -1040,19 +2034,21 @@ export abstract class BaseRedisStorage implements IStorage {
     }
 
     const pattern = `u:${userName}:skip:*`;
-    const oldKeys: string[] = await this.withRetry(() => this.client.keys(pattern));
+    const oldKeys: string[] = await this.withRetry(() =>
+      this.adapter.keys(pattern)
+    );
 
     if (oldKeys.length === 0) {
       console.log(`用户 ${userName} 没有旧的跳过配置，标记为已迁移`);
       await this.withRetry(() =>
-        this.client.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
+        this.adapter.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
       );
       const { userInfoCache } = await import('./user-cache');
       userInfoCache?.delete(userName);
       return;
     }
 
-    const values = await this.withRetry(() => this.client.mGet(oldKeys));
+    const values = await this.withRetry(() => this.adapter.mGet(oldKeys));
 
     const hashData: Record<string, string> = {};
     oldKeys.forEach((key, index) => {
@@ -1068,16 +2064,18 @@ export abstract class BaseRedisStorage implements IStorage {
 
     if (Object.keys(hashData).length > 0) {
       await this.withRetry(() =>
-        this.client.hSet(this.skipHashKey(userName), hashData)
+        this.adapter.hSet(this.skipHashKey(userName), hashData)
       );
-      console.log(`成功迁移 ${Object.keys(hashData).length} 条跳过配置到hash结构`);
+      console.log(
+        `成功迁移 ${Object.keys(hashData).length} 条跳过配置到hash结构`
+      );
     }
 
-    await this.withRetry(() => this.client.del(oldKeys));
+    await this.withRetry(() => this.adapter.del(oldKeys));
     console.log(`删除了 ${oldKeys.length} 个旧的跳过配置key`);
 
     await this.withRetry(() =>
-      this.client.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
+      this.adapter.hSet(this.userInfoKey(userName), 'skip_migrated', 'true')
     );
     const { userInfoCache } = await import('./user-cache');
     userInfoCache?.delete(userName);
@@ -1090,9 +2088,11 @@ export abstract class BaseRedisStorage implements IStorage {
     userName: string
   ): Promise<import('./types').DanmakuFilterConfig | null> {
     const val = await this.withRetry(() =>
-      this.client.get(this.danmakuFilterConfigKey(userName))
+      this.adapter.get(this.danmakuFilterConfigKey(userName))
     );
-    return val ? (JSON.parse(val) as import('./types').DanmakuFilterConfig) : null;
+    return val
+      ? (JSON.parse(val) as import('./types').DanmakuFilterConfig)
+      : null;
   }
 
   async setDanmakuFilterConfig(
@@ -1100,7 +2100,7 @@ export abstract class BaseRedisStorage implements IStorage {
     config: import('./types').DanmakuFilterConfig
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.set(
+      this.adapter.set(
         this.danmakuFilterConfigKey(userName),
         JSON.stringify(config)
       )
@@ -1109,7 +2109,7 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async deleteDanmakuFilterConfig(userName: string): Promise<void> {
     await this.withRetry(() =>
-      this.client.del(this.danmakuFilterConfigKey(userName))
+      this.adapter.del(this.danmakuFilterConfigKey(userName))
     );
   }
 
@@ -1121,11 +2121,11 @@ export abstract class BaseRedisStorage implements IStorage {
 
       // 删除所有用户及其数据
       for (const username of allUsers) {
-        await this.deleteUser(username);
+        await this.deleteUserV2(username);
       }
 
       // 删除管理员配置
-      await this.withRetry(() => this.client.del(this.adminConfigKey()));
+      await this.withRetry(() => this.adapter.del(this.adminConfigKey()));
 
       console.log('所有数据已清空');
     } catch (error) {
@@ -1141,19 +2141,78 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async getGlobalValue(key: string): Promise<string | null> {
     const val = await this.withRetry(() =>
-      this.client.get(this.globalValueKey(key))
+      this.adapter.get(this.globalValueKey(key))
     );
     return val ? ensureString(val) : null;
   }
 
   async setGlobalValue(key: string, value: string): Promise<void> {
     await this.withRetry(() =>
-      this.client.set(this.globalValueKey(key), ensureString(value))
+      this.adapter.set(this.globalValueKey(key), ensureString(value))
     );
   }
 
   async deleteGlobalValue(key: string): Promise<void> {
-    await this.withRetry(() => this.client.del(this.globalValueKey(key)));
+    await this.withRetry(() => this.adapter.del(this.globalValueKey(key)));
+  }
+
+
+  private telegramBindingKey(userName: string) {
+    return `telegram:binding:user:${userName}`;
+  }
+
+  private telegramUserBindingKey(telegramUserId: string) {
+    return `telegram:binding:tg:${telegramUserId}`;
+  }
+
+  private telegramBindSessionKey(code: string) {
+    return `telegram:bind:${code}`;
+  }
+
+  async getTelegramBinding(userName: string): Promise<import('./types').TelegramBindingRecord | null> {
+    const raw = await this.withRetry(() => this.adapter.get(this.telegramBindingKey(userName)));
+    return raw ? (JSON.parse(ensureString(raw)) as import('./types').TelegramBindingRecord) : null;
+  }
+
+  async getTelegramBindingByTelegramUserId(telegramUserId: string): Promise<import('./types').TelegramBindingRecord | null> {
+    const userName = await this.withRetry(() => this.adapter.get(this.telegramUserBindingKey(telegramUserId)));
+    return userName ? this.getTelegramBinding(ensureString(userName)) : null;
+  }
+
+  async upsertTelegramBinding(binding: import('./types').TelegramBindingRecord): Promise<void> {
+    await this.withRetry(() => this.adapter.set(this.telegramBindingKey(binding.username), JSON.stringify(binding)));
+    await this.withRetry(() => this.adapter.set(this.telegramUserBindingKey(binding.telegramUserId), binding.username));
+  }
+
+  async deleteTelegramBindingByUsername(userName: string): Promise<void> {
+    const binding = await this.getTelegramBinding(userName);
+    await this.withRetry(() => this.adapter.del(this.telegramBindingKey(userName)));
+    if (binding) {
+      await this.withRetry(() => this.adapter.del(this.telegramUserBindingKey(binding.telegramUserId)));
+    }
+  }
+
+  async deleteTelegramBindingByTelegramUserId(telegramUserId: string): Promise<void> {
+    const binding = await this.getTelegramBindingByTelegramUserId(telegramUserId);
+    if (binding) {
+      await this.withRetry(() => this.adapter.del(this.telegramBindingKey(binding.username)));
+    }
+    await this.withRetry(() => this.adapter.del(this.telegramUserBindingKey(telegramUserId)));
+  }
+
+  async getTelegramBindSession(code: string): Promise<import('./types').TelegramBindSessionRecord | null> {
+    const raw = await this.withRetry(() => this.adapter.get(this.telegramBindSessionKey(code)));
+    return raw ? (JSON.parse(ensureString(raw)) as import('./types').TelegramBindSessionRecord) : null;
+  }
+
+  async upsertTelegramBindSession(session: import('./types').TelegramBindSessionRecord): Promise<void> {
+    await this.withRetry(() => this.adapter.set(this.telegramBindSessionKey(session.code), JSON.stringify(session)));
+  }
+
+  async markTelegramBindSessionUsed(code: string): Promise<void> {
+    const session = await this.getTelegramBindSession(code);
+    if (!session) return;
+    await this.upsertTelegramBindSession({ ...session, used: true });
   }
 
   // ---------- 通知相关 ----------
@@ -1165,9 +2224,11 @@ export abstract class BaseRedisStorage implements IStorage {
     return `u:${userName}:last_fav_check`;
   }
 
-  async getNotifications(userName: string): Promise<import('./types').Notification[]> {
+  async getNotifications(
+    userName: string
+  ): Promise<import('./types').Notification[]> {
     const val = await this.withRetry(() =>
-      this.client.get(this.notificationsKey(userName))
+      this.adapter.get(this.notificationsKey(userName))
     );
     return val ? (JSON.parse(val) as import('./types').Notification[]) : [];
   }
@@ -1183,8 +2244,13 @@ export abstract class BaseRedisStorage implements IStorage {
       notifications.splice(100);
     }
     await this.withRetry(() =>
-      this.client.set(this.notificationsKey(userName), JSON.stringify(notifications))
+      this.adapter.set(
+        this.notificationsKey(userName),
+        JSON.stringify(notifications)
+      )
     );
+
+    await dispatchNotificationChannels(this, userName, notification);
   }
 
   async markNotificationAsRead(
@@ -1196,7 +2262,10 @@ export abstract class BaseRedisStorage implements IStorage {
     if (notification) {
       notification.read = true;
       await this.withRetry(() =>
-        this.client.set(this.notificationsKey(userName), JSON.stringify(notifications))
+        this.adapter.set(
+          this.notificationsKey(userName),
+          JSON.stringify(notifications)
+        )
       );
     }
   }
@@ -1208,12 +2277,17 @@ export abstract class BaseRedisStorage implements IStorage {
     const notifications = await this.getNotifications(userName);
     const filtered = notifications.filter((n) => n.id !== notificationId);
     await this.withRetry(() =>
-      this.client.set(this.notificationsKey(userName), JSON.stringify(filtered))
+      this.adapter.set(
+        this.notificationsKey(userName),
+        JSON.stringify(filtered)
+      )
     );
   }
 
   async clearAllNotifications(userName: string): Promise<void> {
-    await this.withRetry(() => this.client.del(this.notificationsKey(userName)));
+    await this.withRetry(() =>
+      this.adapter.del(this.notificationsKey(userName))
+    );
   }
 
   async getUnreadNotificationCount(userName: string): Promise<number> {
@@ -1223,7 +2297,7 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async getLastFavoriteCheckTime(userName: string): Promise<number> {
     const val = await this.withRetry(() =>
-      this.client.get(this.lastFavoriteCheckKey(userName))
+      this.adapter.get(this.lastFavoriteCheckKey(userName))
     );
     return val ? parseInt(val, 10) : 0;
   }
@@ -1233,7 +2307,279 @@ export abstract class BaseRedisStorage implements IStorage {
     timestamp: number
   ): Promise<void> {
     await this.withRetry(() =>
-      this.client.set(this.lastFavoriteCheckKey(userName), timestamp.toString())
+      this.adapter.set(
+        this.lastFavoriteCheckKey(userName),
+        timestamp.toString()
+      )
     );
+  }
+
+  async updateLastMovieRequestTime(
+    userName: string,
+    timestamp: number
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.userInfoKey(userName),
+        'last_movie_request_time',
+        timestamp.toString()
+      )
+    );
+  }
+
+  // ---------- 求片相关 ----------
+  private movieRequestsKey() {
+    return 'movie_requests:all';
+  }
+
+  private userMovieRequestsKey(userName: string) {
+    return `u:${userName}:mr`;
+  }
+
+  async getAllMovieRequests(): Promise<import('./types').MovieRequest[]> {
+    const data = await this.withRetry(() =>
+      this.adapter.hGetAll(this.movieRequestsKey())
+    );
+    if (!data || Object.keys(data).length === 0) return [];
+    return Object.values(data).map(
+      (v) => JSON.parse(v) as import('./types').MovieRequest
+    );
+  }
+
+  async getMovieRequest(
+    requestId: string
+  ): Promise<import('./types').MovieRequest | null> {
+    const val = await this.withRetry(() =>
+      this.adapter.hGet(this.movieRequestsKey(), requestId)
+    );
+    return val ? (JSON.parse(val) as import('./types').MovieRequest) : null;
+  }
+
+  async createMovieRequest(
+    request: import('./types').MovieRequest
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.movieRequestsKey(),
+        request.id,
+        JSON.stringify(request)
+      )
+    );
+  }
+
+  async updateMovieRequest(
+    requestId: string,
+    updates: Partial<import('./types').MovieRequest>
+  ): Promise<void> {
+    const existing = await this.getMovieRequest(requestId);
+    if (!existing) throw new Error('Movie request not found');
+    const updated = { ...existing, ...updates };
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.movieRequestsKey(),
+        requestId,
+        JSON.stringify(updated)
+      )
+    );
+  }
+
+  async deleteMovieRequest(requestId: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hDel(this.movieRequestsKey(), requestId)
+    );
+  }
+
+  async getUserMovieRequests(userName: string): Promise<string[]> {
+    const val = await this.withRetry(() =>
+      this.adapter.sMembers(this.userMovieRequestsKey(userName))
+    );
+    return val ? ensureStringArray(val) : [];
+  }
+
+  async addUserMovieRequest(
+    userName: string,
+    requestId: string
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.sAdd(this.userMovieRequestsKey(userName), requestId)
+    );
+  }
+
+  async removeUserMovieRequest(
+    userName: string,
+    requestId: string
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.sRem(this.userMovieRequestsKey(userName), requestId)
+    );
+  }
+
+  // ---------- 用户邮箱相关 ----------
+  async getUserEmail(userName: string): Promise<string | null> {
+    const userInfo = await this.getUserInfoV2(userName);
+    return userInfo?.email || null;
+  }
+
+  async setUserEmail(userName: string, email: string): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(this.userInfoKey(userName), 'email', email)
+    );
+    // 清除缓存
+    userInfoCache?.delete(userName);
+  }
+
+  async getEmailNotificationPreference(userName: string): Promise<boolean> {
+    const userInfo = await this.getUserInfoV2(userName);
+    return userInfo?.emailNotifications || false;
+  }
+
+  async setEmailNotificationPreference(
+    userName: string,
+    enabled: boolean
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.userInfoKey(userName),
+        'emailNotifications',
+        enabled.toString()
+      )
+    );
+    // 清除缓存
+    userInfoCache?.delete(userName);
+  }
+
+
+  private pushSubscriptionsKey(userName: string): string {
+    return `u:${userName}:push_subscriptions`;
+  }
+
+  async upsertPushSubscription(
+    userName: string,
+    subscription: PushSubscriptionRecord
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.pushSubscriptionsKey(userName),
+        subscription.id,
+        JSON.stringify({ ...subscription, username: userName, updatedAt: Date.now() })
+      )
+    );
+  }
+
+  async getEnabledPushSubscriptions(userName: string): Promise<PushSubscriptionRecord[]> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return [];
+
+    return Object.values(all)
+      .map((raw) => {
+        try {
+          return JSON.parse(raw as string) as PushSubscriptionRecord;
+        } catch {
+          return null;
+        }
+      })
+      .filter((item): item is PushSubscriptionRecord => Boolean(item?.enabled));
+  }
+
+  async deletePushSubscriptionByEndpoint(userName: string, endpoint: string): Promise<void> {
+    const subscriptions = await this.getEnabledPushSubscriptions(userName);
+    const target = subscriptions.find((item) => item.endpoint === endpoint);
+    if (!target) return;
+    await this.withRetry(() =>
+      this.adapter.hDel(this.pushSubscriptionsKey(userName), target.id)
+    );
+  }
+
+  async deletePushSubscriptionsByTokenId(userName: string, tokenId: string): Promise<void> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return;
+
+    for (const [id, raw] of Object.entries(all)) {
+      try {
+        const subscription = JSON.parse(raw as string) as PushSubscriptionRecord;
+        if (subscription.tokenId === tokenId) {
+          await this.withRetry(() =>
+            this.adapter.hDel(this.pushSubscriptionsKey(userName), id)
+          );
+        }
+      } catch {
+        // ignore malformed record
+      }
+    }
+  }
+
+  async deleteAllPushSubscriptions(userName: string): Promise<void> {
+    await this.withRetry(() => this.adapter.del(this.pushSubscriptionsKey(userName)));
+  }
+
+  async updatePushSubscriptionDeliveryStats(
+    userName: string,
+    endpoint: string,
+    success: boolean
+  ): Promise<void> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return;
+
+    for (const [id, raw] of Object.entries(all)) {
+      try {
+        const subscription = JSON.parse(raw as string) as PushSubscriptionRecord;
+        if (subscription.endpoint !== endpoint) continue;
+        const now = Date.now();
+        const next = {
+          ...subscription,
+          updatedAt: now,
+          lastSuccessAt: success ? now : subscription.lastSuccessAt || null,
+          lastFailureAt: success ? subscription.lastFailureAt || null : now,
+          failureCount: success ? 0 : (subscription.failureCount || 0) + 1,
+        };
+        await this.withRetry(() =>
+          this.adapter.hSet(this.pushSubscriptionsKey(userName), id, JSON.stringify(next))
+        );
+        return;
+      } catch {
+        // ignore malformed record
+      }
+    }
+  }
+
+  // ---------- TVBox订阅token相关 ----------
+  async getTvboxSubscribeToken(userName: string): Promise<string | null> {
+    // 直接从数据库读取，不使用缓存
+    const token = await this.withRetry(() =>
+      this.adapter.hGet(this.userInfoKey(userName), 'tvboxSubscribeToken')
+    );
+    return token || null;
+  }
+
+  async setTvboxSubscribeToken(userName: string, token: string): Promise<void> {
+    // 保存token到用户信息
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.userInfoKey(userName),
+        'tvboxSubscribeToken',
+        token
+      )
+    );
+
+    // 创建token到用户名的反向索引
+    await this.withRetry(() =>
+      this.adapter.set(`tvbox:token:${token}`, userName)
+    );
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
+  }
+
+  async getUsernameByTvboxToken(token: string): Promise<string | null> {
+    const userName = await this.withRetry(() =>
+      this.adapter.get(`tvbox:token:${token}`)
+    );
+    return userName || null;
   }
 }

@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
+import { requireFeaturePermission } from '@/lib/permissions';
 import { db } from '@/lib/db';
 import { OpenListClient } from '@/lib/openlist.client';
 import {
@@ -21,6 +22,8 @@ export const runtime = 'nodejs';
  */
 export async function POST(request: NextRequest) {
   try {
+    const authResult = await requireFeaturePermission(request, 'private_library', '无权限访问私人影库');
+    if (authResult instanceof NextResponse) return authResult;
     const authInfo = getAuthInfoFromCookie(request);
     if (!authInfo || !authInfo.username) {
       return NextResponse.json({ error: '未授权' }, { status: 401 });
@@ -65,7 +68,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const rootPath = openListConfig.RootPath || '/';
     const client = new OpenListClient(
       openListConfig.URL,
       openListConfig.Username,
@@ -73,7 +75,7 @@ export async function POST(request: NextRequest) {
     );
 
     // 读取现有 metainfo (从数据库或缓存)
-    let metaInfo: MetaInfo | null = getCachedMetaInfo(rootPath);
+    let metaInfo: MetaInfo | null = getCachedMetaInfo();
 
     if (!metaInfo) {
       try {
@@ -132,8 +134,8 @@ export async function POST(request: NextRequest) {
     await db.setGlobalValue('video.metainfo', metainfoContent);
 
     // 更新缓存
-    invalidateMetaInfoCache(rootPath);
-    setCachedMetaInfo(rootPath, metaInfo);
+    invalidateMetaInfoCache();
+    setCachedMetaInfo(metaInfo);
 
     return NextResponse.json({
       success: true,

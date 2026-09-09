@@ -4,13 +4,13 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { getConfig } from '@/lib/config';
 import { db } from '@/lib/db';
-import { OpenListClient } from '@/lib/openlist.client';
 import {
   getCachedMetaInfo,
   MetaInfo,
   setCachedMetaInfo,
 } from '@/lib/openlist-cache';
 import { getTMDBImageUrl } from '@/lib/tmdb.search';
+import { yellowWords } from '@/lib/yellow';
 
 export const runtime = 'nodejs';
 
@@ -23,6 +23,7 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const apiUrl = searchParams.get('api');
+    const yellowFilter = searchParams.get('yellowFilter') === 'true';
 
     if (!apiUrl) {
       return NextResponse.json(
@@ -97,18 +98,7 @@ export async function GET(request: NextRequest) {
       console.log('CMS 代理 origin:', origin);
 
       // 处理返回数据，替换播放链接为代理链接
-      const processedData = processPlayUrls(data, origin);
-
-      // 输出处理后的第一个视频的播放信息（用于调试）
-      if (processedData.list && processedData.list.length > 0) {
-        const firstItem = processedData.list[0];
-        console.log('第一个视频处理后的播放信息:', {
-          vod_name: firstItem.vod_name,
-          vod_play_from: firstItem.vod_play_from,
-          vod_play_url_length: firstItem.vod_play_url?.length || 0,
-          vod_play_url_preview: firstItem.vod_play_url?.substring(0, 200) || '',
-        });
-      }
+      const processedData = processCmsResponse(data, origin, yellowFilter);
 
       return NextResponse.json(processedData, {
         headers: {
@@ -142,13 +132,35 @@ export async function GET(request: NextRequest) {
 /**
  * 处理 CMS API 返回数据，将播放链接替换为代理链接
  */
-function processPlayUrls(data: any, proxyOrigin: string): any {
+function processCmsResponse(data: any, proxyOrigin: string, yellowFilter: boolean): any {
   if (!data || typeof data !== 'object') {
     return data;
   }
 
   // 深拷贝数据，避免修改原始对象
   const processedData = JSON.parse(JSON.stringify(data));
+
+  if (yellowFilter) {
+    if (processedData.class && Array.isArray(processedData.class)) {
+      processedData.class = processedData.class.filter((item: any) => !matchesYellowContent(item?.type_name));
+    }
+
+    if (processedData.list && Array.isArray(processedData.list)) {
+      processedData.list = processedData.list.filter((item: any) => !matchesYellowContent(
+        item?.vod_name,
+        item?.type_name,
+        item?.vod_remarks,
+        item?.vod_content,
+      ));
+
+      if (typeof processedData.total === 'number') {
+        processedData.total = processedData.list.length;
+      }
+      if (typeof processedData.limit === 'number') {
+        processedData.limit = processedData.list.length;
+      }
+    }
+  }
 
   // 获取 M3U8 代理 token
   const proxyToken = process.env.NEXT_PUBLIC_PROXY_M3U8_TOKEN || '';
@@ -184,6 +196,19 @@ function processPlayUrls(data: any, proxyOrigin: string): any {
   }
 
   return processedData;
+}
+
+function matchesYellowContent(...values: Array<string | undefined>): boolean {
+  const normalized = values
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return yellowWords.some((word) => normalized.includes(word.toLowerCase()));
 }
 
 /**
@@ -271,22 +296,15 @@ async function handleOpenListProxy(request: NextRequest) {
     );
   }
 
-  const rootPath = openListConfig.RootPath || '/';
-  const client = new OpenListClient(
-    openListConfig.URL,
-    openListConfig.Username,
-    openListConfig.Password
-  );
-
   // 读取 metainfo (从数据库或缓存)
-  let metaInfo: MetaInfo | null = getCachedMetaInfo(rootPath);
+  let metaInfo: MetaInfo | null = getCachedMetaInfo();
 
   if (!metaInfo) {
     try {
       const metainfoJson = await db.getGlobalValue('video.metainfo');
       if (metainfoJson) {
         metaInfo = JSON.parse(metainfoJson) as MetaInfo;
-        setCachedMetaInfo(rootPath, metaInfo);
+        setCachedMetaInfo(metaInfo);
       }
     } catch (error) {
       return NextResponse.json(
@@ -307,7 +325,7 @@ async function handleOpenListProxy(request: NextRequest) {
   if (wd) {
     const results = Object.entries(metaInfo.folders)
       .filter(
-        ([key, info]) =>
+        ([_key, info]) =>
           info.folderName.toLowerCase().includes(wd.toLowerCase()) ||
           info.title.toLowerCase().includes(wd.toLowerCase())
       )

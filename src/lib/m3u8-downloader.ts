@@ -3,9 +3,37 @@
  * 基于 M3U8Download 项目改造为 TypeScript 版本
  */
 
-import { AESDecryptor } from './aes-decryptor';
-// @ts-ignore - mux.js 没有类型定义
+// @ts-expect-error - mux.js 没有类型定义
 import * as muxjs from 'mux.js';
+
+import { AESDecryptor } from './aes-decryptor';
+import {
+  buildIndexedDBVideoCacheKey,
+  deleteIndexedDBVideoCache,
+  getIndexedDBVideoCacheSize,
+  saveIndexedDBVideoManifest,
+  saveIndexedDBVideoSegment,
+} from './indexeddb-video-cache';
+
+export type M3U8SegmentLogStatus =
+  | 'queued'
+  | 'downloading'
+  | 'success'
+  | 'retry'
+  | 'error'
+  | 'timeout'
+  | 'aborted';
+
+export interface M3U8SegmentLog {
+  id: string;
+  index: number;
+  status: M3U8SegmentLogStatus;
+  message: string;
+  timestamp: number;
+  retryCount?: number;
+  durationMs?: number;
+  httpStatus?: number;
+}
 
 export interface M3U8DownloadTask {
   id: string;
@@ -42,6 +70,18 @@ export interface M3U8DownloadTask {
     key: ArrayBuffer | null;
     decryption: AESDecryptor | null;
   };
+  //禁止SzeMeng76抄袭狗抄袭
+  // File System API 相关字段
+  downloadMode?: 'browser' | 'filesystem' | 'indexeddb';
+  filesystemDirHandle?: FileSystemDirectoryHandle;
+  indexedDBCacheKey?: string;
+  m3u8Content?: string; // 原始 M3U8 内容，用于生成本地播放列表
+  // 视频标识信息（用于区分不同视频）
+  source?: string;
+  videoId?: string;
+  episodeIndex?: number;
+  createdAt?: number; // 创建时间戳
+  segmentLogs: M3U8SegmentLog[]; // 分片下载日志
 }
 
 export interface M3U8DownloaderOptions {
@@ -59,10 +99,37 @@ export class M3U8Downloader {
     this.options = options;
   }
 
+  private addSegmentLog(
+    task: M3U8DownloadTask,
+    log: Omit<M3U8SegmentLog, 'id' | 'timestamp'>
+  ): void {
+    task.segmentLogs.push({
+      ...log,
+      id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: Date.now(),
+    });
+
+    // 控制内存占用，保留最近 1000 条日志
+    if (task.segmentLogs.length > 1000) {
+      task.segmentLogs = task.segmentLogs.slice(-1000);
+    }
+
+    this.options.onProgress?.(task);
+  }
+
   /**
    * 创建下载任务
    */
-  async createTask(url: string, title: string, type: 'TS' | 'MP4' = 'TS'): Promise<string> {
+  async createTask(
+    url: string,
+    title: string,
+    type: 'TS' | 'MP4' = 'TS',
+    metadata?: {
+      source?: string;
+      videoId?: string;
+      episodeIndex?: number;
+    }
+  ): Promise<string> {
     const taskId = 't_' + Date.now() + Math.random().toString(36).substr(2, 9);
 
     try {
@@ -80,11 +147,11 @@ export class M3U8Downloader {
           // 自动选择最高清晰度
           url = streams[0].url;
           const subM3u8Content = await this.fetchM3U8(url);
-          return this.processM3U8Content(taskId, url, title, type, subM3u8Content);
+          return this.processM3U8Content(taskId, url, title, type, subM3u8Content, metadata);
         }
       }
 
-      return this.processM3U8Content(taskId, url, title, type, m3u8Content);
+      return this.processM3U8Content(taskId, url, title, type, m3u8Content, metadata);
     } catch (error) {
       throw new Error(`创建任务失败: ${error}`);
     }
@@ -98,7 +165,12 @@ export class M3U8Downloader {
     url: string,
     title: string,
     type: 'TS' | 'MP4',
-    m3u8Content: string
+    m3u8Content: string,
+    metadata?: {
+      source?: string;
+      videoId?: string;
+      episodeIndex?: number;
+    }
   ): string {
     const task: M3U8DownloadTask = {
       id: taskId,
@@ -110,7 +182,7 @@ export class M3U8Downloader {
       tsUrlList: [],
       requests: [],
       mediaFileList: [],
-      downloadIndex: 0,
+      downloadIndex: 0, // 初始化为 0，在 startTask 时会设置为正确的值
       downloading: false,
       durationSecond: 0,
       beginTime: new Date(),
@@ -120,7 +192,7 @@ export class M3U8Downloader {
       retryCountdown: 0,
       rangeDownload: {
         isShowRange: false,
-        startSegment: 1,
+        startSegment: 0, // 改为从 0 开始
         endSegment: 0,
         targetSegment: 0,
       },
@@ -131,6 +203,12 @@ export class M3U8Downloader {
         key: null,
         decryption: null,
       },
+      m3u8Content, // 保存原始 M3U8 内容
+      source: metadata?.source,
+      videoId: metadata?.videoId,
+      episodeIndex: metadata?.episodeIndex,
+      createdAt: Date.now(),
+      segmentLogs: [],
     };
 
     // 解析 TS 片段
@@ -179,6 +257,19 @@ export class M3U8Downloader {
       await this.getAESKey(task);
     }
 
+    // 重置下载索引到第一个未完成的片段
+    if (task.status === 'ready' || task.status === 'pause') {
+      // 找到第一个未完成的片段
+      let firstIncompleteIndex = 0;
+      for (let i = 0; i < task.finishList.length; i++) {
+        if (task.finishList[i].status !== 'is-success') {
+          firstIncompleteIndex = i;
+          break;
+        }
+      }
+      task.downloadIndex = firstIncompleteIndex;
+    }
+
     task.status = 'downloading';
     this.currentTask = task;
     this.downloadTS(task);
@@ -198,15 +289,65 @@ export class M3U8Downloader {
   /**
    * 取消任务
    */
-  cancelTask(taskId: string): void {
+  async cancelTask(taskId: string): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
 
     this.abortRequests(task);
+
+    // 如果是 filesystem 模式且任务未完成，删除已下载的文件
+    if (task.downloadMode === 'filesystem' && task.status !== 'done' && task.filesystemDirHandle) {
+      await this.deleteFilesystemTask(task);
+    }
+
+    // 如果是 indexeddb 模式且任务未完成，删除独立视频缓存库中的分片
+    if (task.downloadMode === 'indexeddb' && task.status !== 'done') {
+      await this.deleteIndexedDBTask(task);
+    }
+
     this.tasks.delete(taskId);
 
     if (this.currentTask?.id === taskId) {
       this.currentTask = null;
+    }
+  }
+
+  /**
+   * 删除 filesystem 模式下的任务文件
+   */
+  private async deleteFilesystemTask(task: M3U8DownloadTask): Promise<void> {
+    if (!task.filesystemDirHandle || !task.source || !task.videoId || task.episodeIndex === undefined) {
+      return;
+    }
+
+    try {
+      // 获取目标目录
+      const sourceDirHandle = await task.filesystemDirHandle.getDirectoryHandle(task.source, { create: false });
+      const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(task.videoId, { create: false });
+
+      // 删除 ep{n} 目录
+      const epDirName = `ep${task.episodeIndex + 1}`;
+      await videoIdDirHandle.removeEntry(epDirName, { recursive: true });
+
+      console.log(`已删除未完成的下载文件: ${task.source}/${task.videoId}/${epDirName}`);
+    } catch (error) {
+      // 如果目录不存在或删除失败，忽略错误
+      console.warn('删除文件失败（可能目录不存在）:', error);
+    }
+  }
+
+  /**
+   * 删除 IndexedDB 模式下的任务缓存
+   */
+  private async deleteIndexedDBTask(task: M3U8DownloadTask): Promise<void> {
+    const cacheKey = this.getIndexedDBCacheKey(task);
+    if (!cacheKey) return;
+
+    try {
+      await deleteIndexedDBVideoCache(cacheKey);
+      console.log(`已删除未完成的 IndexedDB 视频缓存: ${cacheKey}`);
+    } catch (error) {
+      console.warn('删除 IndexedDB 视频缓存失败:', error);
     }
   }
 
@@ -258,7 +399,7 @@ export class M3U8Downloader {
 
       // 找到第一个失败的片段索引
       let firstErrorIndex = task.rangeDownload.endSegment;
-      for (let i = task.rangeDownload.startSegment - 1; i < task.rangeDownload.endSegment; i++) {
+      for (let i = task.rangeDownload.startSegment; i < task.rangeDownload.endSegment; i++) {
         if (task.finishList[i] && task.finishList[i].status === '') {
           firstErrorIndex = Math.min(firstErrorIndex, i);
         }
@@ -273,6 +414,141 @@ export class M3U8Downloader {
    * 下载 TS 片段
    */
   private downloadTS(task: M3U8DownloadTask): void {
+    const maxRetries = 3;
+    // 单个分片超时时间，默认 30 秒；可通过 localStorage.downloadSegmentTimeout 调整（单位：毫秒）
+    const segmentTimeout = typeof window !== 'undefined'
+      ? Number(localStorage.getItem('downloadSegmentTimeout') || 30000)
+      : 30000;
+
+    const cleanupRequest = (xhr: XMLHttpRequest) => {
+      const requestIndex = task.requests.indexOf(xhr);
+      if (requestIndex >= 0) {
+        task.requests.splice(requestIndex, 1);
+      }
+    };
+
+    const checkAllSegmentsHandled = () => {
+      if (task.finishNum + task.errorNum === task.rangeDownload.targetSegment && task.errorNum > 0) {
+        task.status = 'pause';
+        this.options.onError?.(task, `下载完成，但有 ${task.errorNum} 个片段失败`);
+      }
+    };
+
+    const downloadSegment = (index: number, onSettled: () => void) => {
+      if (task.status === 'pause') {
+        return;
+      }
+
+      if (!task.finishList[index] || task.finishList[index].status !== '') {
+        onSettled();
+        return;
+      }
+
+      task.finishList[index].status = 'is-downloading';
+      if (!task.finishList[index].retryCount) {
+        task.finishList[index].retryCount = 0;
+      }
+      const startTime = Date.now();
+      this.addSegmentLog(task, {
+        index,
+        status: 'downloading',
+        message: `开始下载分片 ${index + 1}`,
+        retryCount: task.finishList[index].retryCount,
+      });
+
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+
+      const handleFailure = (
+        reason: string,
+        status: M3U8SegmentLogStatus = 'error',
+        httpStatus?: number
+      ) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupRequest(xhr);
+
+        // 暂停/取消时 abort 请求，不应计为失败或触发重试
+        if (task.status === 'pause') {
+          return;
+        }
+
+        const currentRetry = task.finishList[index].retryCount || 0;
+
+        if (currentRetry < maxRetries) {
+          task.finishList[index].retryCount = currentRetry + 1;
+          task.finishList[index].status = '';
+          this.addSegmentLog(task, {
+            index,
+            status: 'retry',
+            message: `${reason}，准备第 ${currentRetry + 1}/${maxRetries} 次重试`,
+            retryCount: currentRetry + 1,
+            durationMs: Date.now() - startTime,
+            httpStatus,
+          });
+          console.log(`片段 ${index} ${reason}，正在重试 (${currentRetry + 1}/${maxRetries})...`);
+
+          // 延迟后按原 index 重试，避免失败分片被全局 downloadIndex 跳过后遗留到末尾
+          setTimeout(() => {
+            if (task.status !== 'pause') {
+              downloadSegment(index, onSettled);
+            }
+          }, 1000 * (currentRetry + 1));
+        } else {
+          task.errorNum++;
+          task.finishList[index].status = 'is-error';
+          this.addSegmentLog(task, {
+            index,
+            status,
+            message: `${reason}，重试次数已用尽`,
+            retryCount: currentRetry,
+            durationMs: Date.now() - startTime,
+            httpStatus,
+          });
+          this.options.onError?.(task, `片段 ${index} ${reason}（已重试 ${maxRetries} 次）`);
+          checkAllSegmentsHandled();
+          onSettled();
+        }
+      };
+
+      xhr.responseType = 'arraybuffer';
+      xhr.timeout = Number.isFinite(segmentTimeout) && segmentTimeout > 0 ? segmentTimeout : 30000;
+      xhr.onload = () => {
+        if (settled) {
+          return;
+        }
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          settled = true;
+          cleanupRequest(xhr);
+          this.dealTS(task, xhr.response, index, () => {
+            if (task.finishList[index]?.status === 'is-success') {
+              this.addSegmentLog(task, {
+                index,
+                status: 'success',
+                message: `分片 ${index + 1} 下载完成`,
+                retryCount: task.finishList[index].retryCount || 0,
+                durationMs: Date.now() - startTime,
+                httpStatus: xhr.status,
+              });
+            }
+            onSettled();
+          });
+        } else {
+          handleFailure(`下载失败 HTTP ${xhr.status}`, 'error', xhr.status);
+        }
+      };
+      xhr.onerror = () => handleFailure('网络错误', 'error');
+      xhr.ontimeout = () => handleFailure(`下载超时（${xhr.timeout}ms）`, 'timeout');
+      xhr.onabort = () => handleFailure('请求中止', 'aborted');
+
+      xhr.open('GET', task.tsUrlList[index], true);
+      xhr.send();
+      task.requests.push(xhr);
+    };
+
     const download = () => {
       const isPause = task.status === 'pause';
       const index = task.downloadIndex;
@@ -284,70 +560,23 @@ export class M3U8Downloader {
       task.downloadIndex++;
 
       if (task.finishList[index] && task.finishList[index].status === '') {
-        task.finishList[index].status = 'is-downloading';
-        if (!task.finishList[index].retryCount) {
-          task.finishList[index].retryCount = 0;
-        }
-
-        const xhr = new XMLHttpRequest();
-        xhr.responseType = 'arraybuffer';
-        xhr.onreadystatechange = () => {
-          if (xhr.readyState === 4) {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              this.dealTS(task, xhr.response, index, () => {
-                if (task.downloadIndex < task.rangeDownload.endSegment && !isPause) {
-                  download();
-                }
-              });
-            } else {
-              // 下载失败，检查是否需要重试
-              const maxRetries = 3;
-              const currentRetry = task.finishList[index].retryCount || 0;
-
-              if (currentRetry < maxRetries) {
-                // 重试
-                task.finishList[index].retryCount = currentRetry + 1;
-                task.finishList[index].status = '';
-                console.log(`片段 ${index} 下载失败，正在重试 (${currentRetry + 1}/${maxRetries})...`);
-
-                // 延迟重试，避免立即重试
-                setTimeout(() => {
-                  if (task.status !== 'pause') {
-                    download();
-                  }
-                }, 1000 * (currentRetry + 1)); // 递增延迟
-              } else {
-                // 重试次数用完，标记为最终失败
-                task.errorNum++;
-                task.finishList[index].status = 'is-error';
-                this.options.onError?.(task, `片段 ${index} 下载失败（已重试 ${maxRetries} 次）`);
-
-                // 检查是否所有片段都已处理完成
-                if (task.finishNum + task.errorNum === task.rangeDownload.targetSegment) {
-                  if (task.errorNum > 0) {
-                    task.status = 'pause';
-                    this.options.onError?.(task, `下载完成，但有 ${task.errorNum} 个片段失败`);
-                  }
-                }
-              }
-
-              if (task.downloadIndex < task.rangeDownload.endSegment) {
-                !isPause && download();
-              }
-            }
+        downloadSegment(index, () => {
+          if (task.downloadIndex < task.rangeDownload.endSegment && task.status !== 'pause') {
+            download();
           }
-        };
-
-        xhr.open('GET', task.tsUrlList[index], true);
-        xhr.send();
-        task.requests.push(xhr);
+        });
       } else if (task.downloadIndex < task.rangeDownload.endSegment) {
         !isPause && download();
       }
     };
 
-    // 并发下载 6 个片段
-    const concurrency = Math.min(6, task.rangeDownload.targetSegment - task.finishNum);
+    // 从localStorage读取单任务线程数设置，默认6个
+    const threadsPerTask = typeof window !== 'undefined'
+      ? Number(localStorage.getItem('downloadThreadsPerTask') || 6)
+      : 6;
+
+    // 并发下载片段
+    const concurrency = Math.min(threadsPerTask, task.rangeDownload.targetSegment - task.finishNum);
     for (let i = 0; i < concurrency; i++) {
       download();
     }
@@ -369,38 +598,72 @@ export class M3U8Downloader {
       data = this.aesDecrypt(task, data, index);
     }
 
+    const persistSegment = (processedData: ArrayBuffer) => {
+      this.saveProcessedSegment(task, processedData, index)
+        .then(() => this.markSegmentSuccess(task, index))
+        .then(() => callback())
+        .catch((error) => {
+          console.error('保存分片失败:', error);
+          task.finishList[index].status = 'is-error';
+          task.errorNum++;
+          this.options.onError?.(task, `保存分片 ${index + 1} 失败: ${error}`);
+          callback();
+        });
+    };
+
     // MP4 转码（如果需要）
     if (task.type === 'MP4') {
-      this.conversionMp4(task, data, index, (convertedData) => {
-        task.mediaFileList[index - task.rangeDownload.startSegment + 1] = convertedData;
-        task.finishList[index].status = 'is-success';
-        task.finishNum++;
-
-        this.options.onProgress?.(task);
-
-        if (task.finishNum === task.rangeDownload.targetSegment) {
-          task.status = 'done';
-          this.downloadFile(task);
-          this.options.onComplete?.(task);
-        }
-
-        callback();
-      });
+      this.conversionMp4(task, data, index, persistSegment);
     } else {
-      task.mediaFileList[index - task.rangeDownload.startSegment + 1] = data;
-      task.finishList[index].status = 'is-success';
-      task.finishNum++;
-
-      this.options.onProgress?.(task);
-
-      if (task.finishNum === task.rangeDownload.targetSegment) {
-        task.status = 'done';
-        this.downloadFile(task);
-        this.options.onComplete?.(task);
-      }
-
-      callback();
+      persistSegment(data);
     }
+  }
+
+  /**
+   * 按当前下载模式持久化分片
+   */
+  private async saveProcessedSegment(
+    task: M3U8DownloadTask,
+    data: ArrayBuffer,
+    index: number
+  ): Promise<void> {
+    if (task.downloadMode === 'filesystem') {
+      await this.saveSegmentToFilesystem(task, data, index);
+      return;
+    }
+
+    if (task.downloadMode === 'indexeddb') {
+      await this.saveSegmentToIndexedDB(task, data, index);
+      return;
+    }
+
+    // 浏览器下载模式：保存到内存，完成后合并触发浏览器下载
+    task.mediaFileList[index] = data;
+  }
+
+  /**
+   * 标记分片成功，并在全部完成后执行对应模式的收尾动作
+   */
+  private async markSegmentSuccess(task: M3U8DownloadTask, index: number): Promise<void> {
+    task.finishList[index].status = 'is-success';
+    task.finishNum++;
+
+    this.options.onProgress?.(task);
+
+    if (task.finishNum !== task.rangeDownload.targetSegment) {
+      return;
+    }
+
+    if (task.downloadMode === 'filesystem') {
+      await this.generateLocalPlaylist(task);
+    } else if (task.downloadMode === 'indexeddb') {
+      await this.generateIndexedDBPlaylist(task);
+    } else {
+      this.downloadFile(task);
+    }
+
+    task.status = 'done';
+    this.options.onComplete?.(task);
   }
 
   /**
@@ -599,7 +862,6 @@ export class M3U8Downloader {
   ): void {
     if (task.type === 'MP4') {
       try {
-        // @ts-ignore - mux.js 的 Transmuxer 在 mp4 子模块下
         const transMuxer = new muxjs.mp4.Transmuxer({
           keepOriginalTimestamps: true,
           duration: parseInt(task.durationSecond.toString()),
@@ -607,7 +869,7 @@ export class M3U8Downloader {
 
         transMuxer.on('data', (segment: any) => {
           // 第一个片段需要包含初始化段
-          if (index === task.rangeDownload.startSegment - 1) {
+          if (index === 0) {
             const combinedData = new Uint8Array(
               segment.initSegment.byteLength + segment.data.byteLength
             );
@@ -642,5 +904,252 @@ export class M3U8Downloader {
       }
     });
     task.requests = [];
+  }
+
+  /**
+   * 获取 IndexedDB 视频缓存 Key
+   */
+  private getIndexedDBCacheKey(task: M3U8DownloadTask): string | null {
+    if (task.indexedDBCacheKey) {
+      return task.indexedDBCacheKey;
+    }
+
+    if (task.source && task.videoId && task.episodeIndex !== undefined) {
+      task.indexedDBCacheKey = buildIndexedDBVideoCacheKey(
+        task.source,
+        task.videoId,
+        task.episodeIndex
+      );
+      return task.indexedDBCacheKey;
+    }
+
+    // 缺少业务标识时仍允许缓存任务，但无法在 play 页面按剧集自动命中
+    task.indexedDBCacheKey = `task::${task.id}`;
+    return task.indexedDBCacheKey;
+  }
+
+  /**
+   * 保存分片到独立 IndexedDB 视频缓存库
+   */
+  private async saveSegmentToIndexedDB(
+    task: M3U8DownloadTask,
+    data: ArrayBuffer,
+    index: number
+  ): Promise<void> {
+    const cacheKey = this.getIndexedDBCacheKey(task);
+    if (!cacheKey) {
+      throw new Error('无法生成 IndexedDB 视频缓存 Key');
+    }
+
+    await saveIndexedDBVideoSegment({
+      cacheKey,
+      index,
+      data,
+      mimeType: task.type === 'MP4' ? 'video/mp4' : 'video/MP2T',
+    });
+  }
+
+  //禁止SzeMeng76抄袭狗抄袭
+  /**
+   * 保存分片到文件系统
+   */
+  private async saveSegmentToFilesystem(
+    task: M3U8DownloadTask,
+    data: ArrayBuffer,
+    index: number
+  ): Promise<void> {
+    if (!task.filesystemDirHandle) {
+      throw new Error('未选择保存目录');
+    }
+
+    // 创建子目录结构：source/videoId/ep{episodeIndex+1}
+    let targetDirHandle = task.filesystemDirHandle;
+
+    if (task.source && task.videoId && task.episodeIndex !== undefined) {
+      try {
+        // 创建 source 目录
+        const sourceDirHandle = await task.filesystemDirHandle.getDirectoryHandle(task.source, { create: true });
+        // 创建 videoId 目录
+        const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(task.videoId, { create: true });
+        // 创建 ep{n} 目录
+        const epDirHandle = await videoIdDirHandle.getDirectoryHandle(`ep${task.episodeIndex + 1}`, { create: true });
+        targetDirHandle = epDirHandle;
+      } catch (error) {
+        console.error('创建子目录失败:', error);
+        throw error;
+      }
+    }
+
+    const filename = `segment_${index.toString().padStart(5, '0')}.ts`;
+
+    try {
+      const fileHandle = await targetDirHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(data);
+      await writable.close();
+    } catch (error) {
+      console.error(`保存分片 ${filename} 失败:`, error);
+      throw error;
+    }
+  }
+
+  //禁止SzeMeng76抄袭狗抄袭
+  /**
+   * 生成本地 M3U8 播放列表
+   */
+  private async generateLocalPlaylist(task: M3U8DownloadTask): Promise<void> {
+    if (!task.filesystemDirHandle || !task.m3u8Content) {
+      console.error('无法生成播放列表：缺少目录句柄或 M3U8 内容');
+      return;
+    }
+
+    // 获取目标目录句柄（如果有子目录结构）
+    let targetDirHandle = task.filesystemDirHandle;
+
+    if (task.source && task.videoId && task.episodeIndex !== undefined) {
+      try {
+        const sourceDirHandle = await task.filesystemDirHandle.getDirectoryHandle(task.source, { create: false });
+        const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(task.videoId, { create: false });
+        const epDirHandle = await videoIdDirHandle.getDirectoryHandle(`ep${task.episodeIndex + 1}`, { create: false });
+        targetDirHandle = epDirHandle;
+      } catch (error) {
+        console.error('获取子目录失败:', error);
+        return;
+      }
+    }
+
+    try {
+      const lines = task.m3u8Content.split('\n');
+      const modifiedLines: string[] = [];
+      let segmentIndex = task.rangeDownload.startSegment;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmedLine = line.trim();
+
+        // 替换加密密钥 URI
+        if (trimmedLine.startsWith('#EXT-X-KEY:')) {
+          if (task.aesConf.method && task.aesConf.method !== 'NONE') {
+            // 如果有加密，保存密钥文件
+            if (task.aesConf.key) {
+              await this.saveKeyToFilesystem(task, task.aesConf.key, targetDirHandle);
+            }
+            const modifiedLine = line.replace(/URI="[^"]+"/g, 'URI="key.key"');
+            modifiedLines.push(modifiedLine);
+          } else {
+            modifiedLines.push(line);
+          }
+        }
+        // 替换视频片段 URL
+        else if (trimmedLine && !trimmedLine.startsWith('#')) {
+          if (segmentIndex < task.rangeDownload.endSegment) {
+            const indent = line.match(/^\s*/)?.[0] || '';
+            const filename = `segment_${segmentIndex.toString().padStart(5, '0')}.ts`;
+            modifiedLines.push(indent + filename);
+            segmentIndex++;
+          } else {
+            modifiedLines.push(line);
+          }
+        }
+        // 保持其他所有行不变
+        else {
+          modifiedLines.push(line);
+        }
+      }
+
+      // 保存播放列表
+      const playlistContent = modifiedLines.join('\n');
+      const fileHandle = await targetDirHandle.getFileHandle('playlist.m3u8', { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(playlistContent);
+      await writable.close();
+    } catch (error) {
+      console.error('生成播放列表失败:', error);
+    }
+  }
+
+  /**
+   * 生成 IndexedDB 本地 M3U8 播放列表并保存缓存清单
+   */
+  private async generateIndexedDBPlaylist(task: M3U8DownloadTask): Promise<void> {
+    const cacheKey = this.getIndexedDBCacheKey(task);
+    if (!cacheKey || !task.m3u8Content) {
+      throw new Error('无法生成 IndexedDB 播放列表：缺少缓存 Key 或 M3U8 内容');
+    }
+
+    if (!task.source || !task.videoId || task.episodeIndex === undefined) {
+      throw new Error('无法生成 IndexedDB 播放列表：缺少视频标识信息');
+    }
+
+    const lines = task.m3u8Content.split('\n');
+    const modifiedLines: string[] = [];
+    let segmentIndex = task.rangeDownload.startSegment;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+
+      // 下载器会先解密再持久化分片，因此本地播放列表不再保留密钥行，
+      // 避免播放器对已解密分片二次解密。
+      if (
+        trimmedLine.startsWith('#EXT-X-KEY:') &&
+        task.aesConf.method &&
+        task.aesConf.method !== 'NONE'
+      ) {
+        continue;
+      }
+
+      if (trimmedLine && !trimmedLine.startsWith('#')) {
+        if (segmentIndex < task.rangeDownload.endSegment) {
+          const indent = line.match(/^\s*/)?.[0] || '';
+          const filename = `segment_${segmentIndex.toString().padStart(5, '0')}.ts`;
+          modifiedLines.push(indent + filename);
+          segmentIndex++;
+        } else {
+          modifiedLines.push(line);
+        }
+      } else {
+        modifiedLines.push(line);
+      }
+    }
+
+    const totalSize = await getIndexedDBVideoCacheSize(cacheKey);
+    await saveIndexedDBVideoManifest({
+      cacheKey,
+      source: task.source,
+      videoId: task.videoId,
+      episodeIndex: task.episodeIndex,
+      title: task.title,
+      playlistContent: modifiedLines.join('\n'),
+      m3u8Content: task.m3u8Content,
+      segmentCount: task.rangeDownload.targetSegment,
+      completed: true,
+      mimeType: task.type === 'MP4' ? 'video/mp4' : 'video/MP2T',
+      totalSize,
+    });
+  }
+
+  //禁止SzeMeng76抄袭狗抄袭
+  /**
+   * 保存加密密钥到文件系统
+   */
+  private async saveKeyToFilesystem(
+    task: M3U8DownloadTask,
+    keyData: ArrayBuffer,
+    targetDirHandle?: FileSystemDirectoryHandle
+  ): Promise<void> {
+    const dirHandle = targetDirHandle || task.filesystemDirHandle;
+    if (!dirHandle) {
+      return;
+    }
+
+    try {
+      const fileHandle = await dirHandle.getFileHandle('key.key', { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(keyData);
+      await writable.close();
+    } catch (error) {
+      console.error('保存密钥失败:', error);
+    }
   }
 }

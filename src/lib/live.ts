@@ -5,6 +5,28 @@ import { db } from '@/lib/db';
 
 const defaultUA = 'AptvPlayer/1.4.10';
 
+export const DEFAULT_LIVE_REFRESH_INTERVAL_HOURS = 12;
+
+let lastGlobalLiveRefreshTime = 0;
+
+export function getLiveRefreshIntervalHours(refreshIntervalHours?: number): number {
+  const normalizedInterval = Number(refreshIntervalHours);
+
+  if (!Number.isFinite(normalizedInterval) || normalizedInterval <= 0) {
+    return DEFAULT_LIVE_REFRESH_INTERVAL_HOURS;
+  }
+
+  return Math.floor(normalizedInterval);
+}
+
+export function getLastGlobalLiveRefreshTime(): number {
+  return lastGlobalLiveRefreshTime;
+}
+
+export function setLastGlobalLiveRefreshTime(timestamp: number): void {
+  lastGlobalLiveRefreshTime = timestamp;
+}
+
 export interface LiveChannels {
   channelNumber: number;
   channels: {
@@ -70,7 +92,9 @@ export async function refreshLiveChannels(liveInfo: {
     },
   });
   const data = await response.text();
-  const result = parseM3U(liveInfo.key, data);
+  const result = isM3UContent(data)
+    ? parseM3U(liveInfo.key, data)
+    : parseTxtLive(liveInfo.key, data);
   const epgUrl = liveInfo.epg || result.tvgUrl;
   const tvgIds = result.channels
     .map((channel) => channel.tvgId)
@@ -367,6 +391,86 @@ function parseEpgLines(
   return result;
 }
 
+function stripBom(value: string) {
+  return value.replace(/^\uFEFF/, '');
+}
+
+function isM3UContent(content: string) {
+  const normalized = stripBom(content).trim();
+  return normalized.includes('#EXTM3U') || normalized.includes('#EXTINF');
+}
+
+function isHttpUrl(value: string) {
+  return /^https?:\/\//i.test(value);
+}
+
+function parseTxtLive(
+  sourceKey: string,
+  txtContent: string
+): {
+  tvgUrl: string;
+  channels: {
+    id: string;
+    tvgId: string;
+    name: string;
+    logo: string;
+    group: string;
+    url: string;
+  }[];
+} {
+  const channels: {
+    id: string;
+    tvgId: string;
+    name: string;
+    logo: string;
+    group: string;
+    url: string;
+  }[] = [];
+
+  const lines = txtContent
+    .split('\n')
+    .map((line) => stripBom(line).trim())
+    .filter((line) => line.length > 0);
+
+  let currentGroup = '无分组';
+  let channelIndex = 0;
+
+  for (const line of lines) {
+    const commaIndex = line.indexOf(',');
+    if (commaIndex === -1) {
+      continue;
+    }
+
+    const name = line.slice(0, commaIndex).trim();
+    const value = line.slice(commaIndex + 1).trim();
+
+    if (!name) {
+      continue;
+    }
+
+    if (value === '#genre#') {
+      currentGroup = name;
+      continue;
+    }
+
+    if (!value || !isHttpUrl(value)) {
+      continue;
+    }
+
+    channels.push({
+      id: `${sourceKey}-${channelIndex}`,
+      tvgId: name,
+      name,
+      logo: '',
+      group: currentGroup,
+      url: value,
+    });
+    channelIndex++;
+  }
+
+  return { tvgUrl: '', channels };
+}
+
 /**
  * 解析M3U文件内容，提取频道信息
  * @param m3uContent M3U文件的内容字符串
@@ -397,7 +501,7 @@ function parseM3U(
 
   const lines = m3uContent
     .split('\n')
-    .map((line) => line.trim())
+    .map((line) => stripBom(line).trim())
     .filter((line) => line.length > 0);
 
   let tvgUrl = '';

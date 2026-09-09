@@ -1,33 +1,197 @@
 /* eslint-disable no-console, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
 import { AdminConfig } from './admin.types';
-import { KvrocksStorage } from './kvrocks.db';
-import { RedisStorage } from './redis.db';
-import { Favorite, IStorage, PlayRecord, SkipConfig, DanmakuFilterConfig } from './types';
-import { UpstashRedisStorage } from './upstash.db';
+import { MusicPlayRecord } from './db.client';
+import { MangaReadRecord, MangaShelfItem } from './manga.types';
+import { BookReadRecord, BookShelfItem } from './book.types';
+import {
+  MusicV2HistoryRecord,
+  MusicV2PlaylistItem,
+  MusicV2PlaylistRecord,
+} from './music-v2';
+import {
+  DanmakuFilterConfig,
+  Favorite,
+  IStorage,
+  LocalSettingsSyncRecord,
+  PlayRecord,
+  SetLocalSettingsSyncOptions,
+  SetLocalSettingsSyncResult,
+  SkipConfig,
+} from './types';
 
-// storage type 常量: 'localstorage' | 'redis' | 'upstash'，默认 'localstorage'
+// storage type 常量: 'localstorage' | 'redis' | 'upstash' | 'kvrocks' | 'd1' | 'postgres' | 'turso'，默认 'localstorage'
+const IS_CLOUDFLARE_BUILD =
+  process.env.CF_PAGES === '1' || process.env.BUILD_TARGET === 'cloudflare';
 const STORAGE_TYPE =
   (process.env.NEXT_PUBLIC_STORAGE_TYPE as
     | 'localstorage'
     | 'redis'
     | 'upstash'
     | 'kvrocks'
+    | 'd1'
+    | 'postgres'
+    | 'turso'
     | undefined) || 'localstorage';
 
 // 创建存储实例
 function createStorage(): IStorage {
   switch (STORAGE_TYPE) {
     case 'redis':
+      if (IS_CLOUDFLARE_BUILD) {
+        throw new Error(
+          'Node Redis storage is not supported in Cloudflare builds. Use D1 or Upstash instead.'
+        );
+      }
+      const { RedisStorage } = require('./redis.db');
       return new RedisStorage();
     case 'upstash':
+      const { UpstashRedisStorage } = require('./upstash.db');
       return new UpstashRedisStorage();
     case 'kvrocks':
+      if (IS_CLOUDFLARE_BUILD) {
+        throw new Error(
+          'Kvrocks storage is not supported in Cloudflare builds. Use D1 or Upstash instead.'
+        );
+      }
+      const { KvrocksStorage } = require('./kvrocks.db');
       return new KvrocksStorage();
+    case 'd1':
+      // D1Storage 只能在服务端使用，客户端会报错
+      if (typeof window !== 'undefined') {
+        throw new Error('D1Storage can only be used on the server side');
+      }
+      const d1Adapter = getD1Adapter();
+      // 动态导入 D1Storage 以避免客户端打包
+      const { D1Storage } = require('./d1.db');
+      return new D1Storage(d1Adapter);
+    case 'postgres':
+      // PostgresStorage 只能在服务端使用，客户端会报错
+      if (typeof window !== 'undefined') {
+        throw new Error('PostgresStorage can only be used on the server side');
+      }
+      const postgresAdapter = getPostgresAdapter();
+      // 动态导入 PostgresStorage 以避免客户端打包
+      const { PostgresStorage } = require('./postgres.db');
+      return new PostgresStorage(postgresAdapter);
+    case 'turso':
+      // TursoStorage 只能在服务端使用，客户端会报错
+      if (typeof window !== 'undefined') {
+        throw new Error('TursoStorage can only be used on the server side');
+      }
+      const tursoAdapter = getTursoAdapter();
+      // 复用 D1Storage（Turso 基于 libSQL/SQLite，SQL 语法完全兼容）
+      const { D1Storage: TursoD1Storage } = require('./d1.db');
+      return new TursoD1Storage(tursoAdapter);
     case 'localstorage':
     default:
       return null as unknown as IStorage;
   }
+}
+
+/**
+ * 获取 Postgres 适配器
+ * 使用 Vercel Postgres (@vercel/postgres)
+ */
+function getPostgresAdapter(): any {
+  // 动态导入适配器以避免客户端打包
+  const { PostgresAdapter } = require('./postgres-adapter');
+
+  console.log('Using Vercel Postgres database');
+
+  return new PostgresAdapter();
+}
+
+/**
+ * 获取 Turso 适配器
+ * 使用 @libsql/client 连接 Turso (libSQL) 远程数据库
+ * 适用于 EdgeOne Pages 等无内置数据库的边缘平台
+ */
+function getTursoAdapter(): any {
+  // 动态导入适配器以避免客户端打包
+  const { TursoAdapter } = require('./turso-adapter');
+
+  const tursoUrl = process.env.TURSO_URL;
+  const tursoToken = process.env.TURSO_TOKEN;
+
+  if (!tursoUrl || !tursoToken) {
+    throw new Error(
+      'TURSO_URL and TURSO_TOKEN env variables must be set for Turso storage'
+    );
+  }
+
+  console.log('Using Turso (libSQL) database');
+
+  return new TursoAdapter(tursoUrl, tursoToken);
+}
+
+/**
+ * 获取 D1 适配器
+ * 开发环境：使用 better-sqlite3
+ * 生产环境：使用 Cloudflare D1
+ */
+function getD1Adapter(): any {
+  // 动态导入适配器以避免客户端打包
+  const { CloudflareD1Adapter, SQLiteAdapter } = require('./d1-adapter');
+
+  // 检查是否为 Cloudflare 构建
+  const isCloudflare =
+    process.env.CF_PAGES === '1' || process.env.BUILD_TARGET === 'cloudflare';
+
+  // 生产环境：Cloudflare Workers/Pages
+  if (isCloudflare) {
+    // 创建一个懒加载的适配器，延迟到实际使用时才获取 D1 绑定
+    let cachedAdapter: any = null;
+
+    return new Proxy(
+      {},
+      {
+        get(target, prop) {
+          // 懒加载：第一次访问时才获取真实的 D1 适配器
+          if (!cachedAdapter) {
+            try {
+              const {
+                getCloudflareContext,
+              } = require('@opennextjs/cloudflare');
+              const { env } = getCloudflareContext();
+
+              if (!env.DB) {
+                throw new Error(
+                  'D1 database binding (DB) not found in Cloudflare environment'
+                );
+              }
+
+              console.log('Using Cloudflare D1 database');
+              cachedAdapter = new CloudflareD1Adapter(env.DB);
+            } catch (error) {
+              console.error('Failed to initialize Cloudflare D1:', error);
+              throw error;
+            }
+          }
+
+          return cachedAdapter[prop];
+        },
+      }
+    );
+  }
+
+  // 开发环境：better-sqlite3
+  const Database = require('better-sqlite3');
+  const path = require('path');
+
+  const dbPath =
+    process.env.SQLITE_DB_PATH ||
+    path.join(process.cwd(), '.data', 'moontv.db');
+
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL'); // 启用 WAL 模式提升性能
+  db.pragma('foreign_keys = ON'); // 与 D1 保持一致，启用外键约束
+  db.pragma('busy_timeout = 5000'); // 避免启动阶段或并发写入时立即锁失败
+
+  console.log('Using SQLite database (non-Cloudflare mode)');
+  console.log('Database location:', dbPath);
+
+  return new SQLiteAdapter(db);
 }
 
 // 单例存储实例
@@ -88,6 +252,10 @@ export class DbManager {
     await this.storage.deletePlayRecord(userName, key);
   }
 
+  async deletePlayRecords(userName: string, keys: string[]): Promise<void> {
+    await this.storage.deletePlayRecords(userName, keys);
+  }
+
   // 收藏相关方法
   async getFavorite(
     userName: string,
@@ -132,7 +300,273 @@ export class DbManager {
     return favorite !== null;
   }
 
- 
+  // 音乐播放记录相关方法
+  async saveMusicPlayRecord(
+    userName: string,
+    platform: string,
+    id: string,
+    record: MusicPlayRecord
+  ): Promise<void> {
+    const key = generateStorageKey(platform, id);
+    await this.storage.setMusicPlayRecord(userName, key, record);
+  }
+
+  async batchSaveMusicPlayRecords(
+    userName: string,
+    records: Array<{ platform: string; id: string; record: MusicPlayRecord }>
+  ): Promise<void> {
+    const batchRecords = records.map(({ platform, id, record }) => ({
+      key: generateStorageKey(platform, id),
+      record,
+    }));
+    await this.storage.batchSetMusicPlayRecords(userName, batchRecords);
+  }
+
+  async getAllMusicPlayRecords(userName: string): Promise<{
+    [key: string]: MusicPlayRecord;
+  }> {
+    return this.storage.getAllMusicPlayRecords(userName);
+  }
+
+  async deleteMusicPlayRecord(
+    userName: string,
+    platform: string,
+    id: string
+  ): Promise<void> {
+    const key = generateStorageKey(platform, id);
+    await this.storage.deleteMusicPlayRecord(userName, key);
+  }
+
+  async clearAllMusicPlayRecords(userName: string): Promise<void> {
+    await this.storage.clearAllMusicPlayRecords(userName);
+  }
+
+  // Music V2 历史记录相关
+  async listMusicV2History(userName: string): Promise<MusicV2HistoryRecord[]> {
+    if (typeof (this.storage as any).listMusicV2History === 'function') {
+      // 按播放队列顺序返回（createdAt ASC），
+      // 当前播放项由调用方基于 lastPlayedAt 决定。
+      return (this.storage as any).listMusicV2History(userName);
+    }
+    return [];
+  }
+
+  async upsertMusicV2History(
+    userName: string,
+    record: MusicV2HistoryRecord
+  ): Promise<void> {
+    if (typeof (this.storage as any).upsertMusicV2History === 'function') {
+      await (this.storage as any).upsertMusicV2History(userName, record);
+    }
+  }
+
+  async batchUpsertMusicV2History(
+    userName: string,
+    records: MusicV2HistoryRecord[]
+  ): Promise<void> {
+    if (typeof (this.storage as any).batchUpsertMusicV2History === 'function') {
+      await (this.storage as any).batchUpsertMusicV2History(userName, records);
+    }
+  }
+
+  async deleteMusicV2History(userName: string, songId: string): Promise<void> {
+    if (typeof (this.storage as any).deleteMusicV2History === 'function') {
+      await (this.storage as any).deleteMusicV2History(userName, songId);
+    }
+  }
+
+  async clearMusicV2History(userName: string): Promise<void> {
+    if (typeof (this.storage as any).clearMusicV2History === 'function') {
+      await (this.storage as any).clearMusicV2History(userName);
+    }
+  }
+
+  // Music V2 歌单相关
+  async createMusicV2Playlist(
+    userName: string,
+    playlist: { id: string; name: string; description?: string; cover?: string }
+  ): Promise<void> {
+    if (typeof (this.storage as any).createMusicV2Playlist === 'function') {
+      await (this.storage as any).createMusicV2Playlist(userName, playlist);
+    }
+  }
+
+  async getMusicV2Playlist(
+    playlistId: string
+  ): Promise<MusicV2PlaylistRecord | null> {
+    if (typeof (this.storage as any).getMusicV2Playlist === 'function') {
+      return (this.storage as any).getMusicV2Playlist(playlistId);
+    }
+    return null;
+  }
+
+  async listMusicV2Playlists(
+    userName: string
+  ): Promise<MusicV2PlaylistRecord[]> {
+    if (typeof (this.storage as any).listMusicV2Playlists === 'function') {
+      return (this.storage as any).listMusicV2Playlists(userName);
+    }
+    return [];
+  }
+
+  async updateMusicV2Playlist(
+    playlistId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      cover?: string;
+      song_count?: number;
+    }
+  ): Promise<void> {
+    if (typeof (this.storage as any).updateMusicV2Playlist === 'function') {
+      await (this.storage as any).updateMusicV2Playlist(playlistId, updates);
+    }
+  }
+
+  async deleteMusicV2Playlist(playlistId: string): Promise<void> {
+    if (typeof (this.storage as any).deleteMusicV2Playlist === 'function') {
+      await (this.storage as any).deleteMusicV2Playlist(playlistId);
+    }
+  }
+
+  async addMusicV2PlaylistItem(
+    playlistId: string,
+    item: MusicV2PlaylistItem
+  ): Promise<void> {
+    if (typeof (this.storage as any).addMusicV2PlaylistItem === 'function') {
+      await (this.storage as any).addMusicV2PlaylistItem(playlistId, item);
+    }
+  }
+
+  async removeMusicV2PlaylistItem(
+    playlistId: string,
+    songId: string
+  ): Promise<void> {
+    if (typeof (this.storage as any).removeMusicV2PlaylistItem === 'function') {
+      await (this.storage as any).removeMusicV2PlaylistItem(playlistId, songId);
+    }
+  }
+
+  async listMusicV2PlaylistItems(
+    playlistId: string
+  ): Promise<MusicV2PlaylistItem[]> {
+    if (typeof (this.storage as any).listMusicV2PlaylistItems === 'function') {
+      return (this.storage as any).listMusicV2PlaylistItems(playlistId);
+    }
+    return [];
+  }
+
+  async hasMusicV2PlaylistItem(
+    playlistId: string,
+    songId: string
+  ): Promise<boolean> {
+    if (typeof (this.storage as any).hasMusicV2PlaylistItem === 'function') {
+      return (this.storage as any).hasMusicV2PlaylistItem(playlistId, songId);
+    }
+    return false;
+  }
+
+  // 音乐歌单相关方法
+  async createMusicPlaylist(
+    userName: string,
+    playlist: {
+      id: string;
+      name: string;
+      description?: string;
+      cover?: string;
+    }
+  ): Promise<void> {
+    if (typeof (this.storage as any).createMusicPlaylist === 'function') {
+      await (this.storage as any).createMusicPlaylist(userName, playlist);
+    }
+  }
+
+  async getMusicPlaylist(playlistId: string): Promise<any | null> {
+    if (typeof (this.storage as any).getMusicPlaylist === 'function') {
+      return (this.storage as any).getMusicPlaylist(playlistId);
+    }
+    return null;
+  }
+
+  async getUserMusicPlaylists(userName: string): Promise<any[]> {
+    if (typeof (this.storage as any).getUserMusicPlaylists === 'function') {
+      return (this.storage as any).getUserMusicPlaylists(userName);
+    }
+    return [];
+  }
+
+  async updateMusicPlaylist(
+    playlistId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      cover?: string;
+    }
+  ): Promise<void> {
+    if (typeof (this.storage as any).updateMusicPlaylist === 'function') {
+      await (this.storage as any).updateMusicPlaylist(playlistId, updates);
+    }
+  }
+
+  async deleteMusicPlaylist(playlistId: string): Promise<void> {
+    if (typeof (this.storage as any).deleteMusicPlaylist === 'function') {
+      await (this.storage as any).deleteMusicPlaylist(playlistId);
+    }
+  }
+
+  async addSongToPlaylist(
+    playlistId: string,
+    song: {
+      platform: string;
+      id: string;
+      name: string;
+      artist: string;
+      album?: string;
+      pic?: string;
+      duration: number;
+    }
+  ): Promise<void> {
+    if (typeof (this.storage as any).addSongToPlaylist === 'function') {
+      await (this.storage as any).addSongToPlaylist(playlistId, song);
+    }
+  }
+
+  async removeSongFromPlaylist(
+    playlistId: string,
+    platform: string,
+    songId: string
+  ): Promise<void> {
+    if (typeof (this.storage as any).removeSongFromPlaylist === 'function') {
+      await (this.storage as any).removeSongFromPlaylist(
+        playlistId,
+        platform,
+        songId
+      );
+    }
+  }
+
+  async getPlaylistSongs(playlistId: string): Promise<any[]> {
+    if (typeof (this.storage as any).getPlaylistSongs === 'function') {
+      return (this.storage as any).getPlaylistSongs(playlistId);
+    }
+    return [];
+  }
+
+  async isSongInPlaylist(
+    playlistId: string,
+    platform: string,
+    songId: string
+  ): Promise<boolean> {
+    if (typeof (this.storage as any).isSongInPlaylist === 'function') {
+      return (this.storage as any).isSongInPlaylist(
+        playlistId,
+        platform,
+        songId
+      );
+    }
+    return false;
+  }
+
   async verifyUser(userName: string, password: string): Promise<boolean> {
     return this.storage.verifyUser(userName, password);
   }
@@ -160,7 +594,14 @@ export class DbManager {
     enabledApis?: string[]
   ): Promise<void> {
     if (typeof (this.storage as any).createUserV2 === 'function') {
-      await (this.storage as any).createUserV2(userName, password, role, tags, oidcSub, enabledApis);
+      await (this.storage as any).createUserV2(
+        userName,
+        password,
+        role,
+        tags,
+        oidcSub,
+        enabledApis
+      );
     }
   }
 
@@ -224,9 +665,10 @@ export class DbManager {
   }
 
   async getUserListV2(
-    offset: number = 0,
-    limit: number = 20,
-    ownerUsername?: string
+    offset = 0,
+    limit = 20,
+    ownerUsername?: string,
+    search?: string
   ): Promise<{
     users: Array<{
       username: string;
@@ -240,7 +682,12 @@ export class DbManager {
     total: number;
   }> {
     if (typeof (this.storage as any).getUserListV2 === 'function') {
-      return (this.storage as any).getUserListV2(offset, limit, ownerUsername);
+      return (this.storage as any).getUserListV2(
+        offset,
+        limit,
+        ownerUsername,
+        search
+      );
     }
     return { users: [], total: 0 };
   }
@@ -256,6 +703,27 @@ export class DbManager {
       return (this.storage as any).getUsersByTag(tagName);
     }
     return [];
+  }
+
+  // ---------- TVBox订阅token ----------
+  async getTvboxSubscribeToken(userName: string): Promise<string | null> {
+    if (typeof (this.storage as any).getTvboxSubscribeToken === 'function') {
+      return (this.storage as any).getTvboxSubscribeToken(userName);
+    }
+    return null;
+  }
+
+  async setTvboxSubscribeToken(userName: string, token: string): Promise<void> {
+    if (typeof (this.storage as any).setTvboxSubscribeToken === 'function') {
+      await (this.storage as any).setTvboxSubscribeToken(userName, token);
+    }
+  }
+
+  async getUsernameByTvboxToken(token: string): Promise<string | null> {
+    if (typeof (this.storage as any).getUsernameByTvboxToken === 'function') {
+      return (this.storage as any).getUsernameByTvboxToken(token);
+    }
+    return null;
   }
 
   // ---------- 播放记录迁移 ----------
@@ -319,7 +787,9 @@ export class DbManager {
         else {
           try {
             if ((this.storage as any).client) {
-              const storedPassword = await (this.storage as any).client.get(`u:${user.username}:pwd`);
+              const storedPassword = await (this.storage as any).client.get(
+                `u:${user.username}:pwd`
+              );
               if (storedPassword) {
                 password = storedPassword;
                 console.log(`用户 ${user.username} 使用旧密码迁移`);
@@ -332,7 +802,10 @@ export class DbManager {
               password = 'defaultPassword123';
             }
           } catch (err) {
-            console.error(`获取用户 ${user.username} 的密码失败，使用默认密码`, err);
+            console.error(
+              `获取用户 ${user.username} 的密码失败，使用默认密码`,
+              err
+            );
             password = 'defaultPassword123';
           }
         }
@@ -380,6 +853,174 @@ export class DbManager {
     await this.storage.deleteSearchHistory(userName, keyword);
   }
 
+  // ---------- 漫画书架 ----------
+  async getMangaShelf(
+    userName: string,
+    sourceId: string,
+    mangaId: string
+  ): Promise<MangaShelfItem | null> {
+    return this.storage.getMangaShelf(
+      userName,
+      generateStorageKey(sourceId, mangaId)
+    );
+  }
+
+  async saveMangaShelf(
+    userName: string,
+    sourceId: string,
+    mangaId: string,
+    item: MangaShelfItem
+  ): Promise<void> {
+    await this.storage.setMangaShelf(
+      userName,
+      generateStorageKey(sourceId, mangaId),
+      item
+    );
+  }
+
+  async getAllMangaShelf(
+    userName: string
+  ): Promise<{ [key: string]: MangaShelfItem }> {
+    return this.storage.getAllMangaShelf(userName);
+  }
+
+  async deleteMangaShelf(
+    userName: string,
+    sourceId: string,
+    mangaId: string
+  ): Promise<void> {
+    await this.storage.deleteMangaShelf(
+      userName,
+      generateStorageKey(sourceId, mangaId)
+    );
+  }
+
+  // ---------- 漫画阅读历史 ----------
+  async getMangaReadRecord(
+    userName: string,
+    sourceId: string,
+    mangaId: string
+  ): Promise<MangaReadRecord | null> {
+    return this.storage.getMangaReadRecord(
+      userName,
+      generateStorageKey(sourceId, mangaId)
+    );
+  }
+
+  async saveMangaReadRecord(
+    userName: string,
+    sourceId: string,
+    mangaId: string,
+    record: MangaReadRecord
+  ): Promise<void> {
+    await this.storage.setMangaReadRecord(
+      userName,
+      generateStorageKey(sourceId, mangaId),
+      record
+    );
+  }
+
+  async getAllMangaReadRecords(
+    userName: string
+  ): Promise<{ [key: string]: MangaReadRecord }> {
+    return this.storage.getAllMangaReadRecords(userName);
+  }
+
+  async deleteMangaReadRecord(
+    userName: string,
+    sourceId: string,
+    mangaId: string
+  ): Promise<void> {
+    await this.storage.deleteMangaReadRecord(
+      userName,
+      generateStorageKey(sourceId, mangaId)
+    );
+  }
+
+  // ---------- 电子书书架 ----------
+  async getBookShelf(
+    userName: string,
+    sourceId: string,
+    bookId: string
+  ): Promise<BookShelfItem | null> {
+    return this.storage.getBookShelf(
+      userName,
+      generateStorageKey(sourceId, bookId)
+    );
+  }
+
+  async saveBookShelf(
+    userName: string,
+    sourceId: string,
+    bookId: string,
+    item: BookShelfItem
+  ): Promise<void> {
+    await this.storage.setBookShelf(
+      userName,
+      generateStorageKey(sourceId, bookId),
+      item
+    );
+  }
+
+  async getAllBookShelf(
+    userName: string
+  ): Promise<{ [key: string]: BookShelfItem }> {
+    return this.storage.getAllBookShelf(userName);
+  }
+
+  async deleteBookShelf(
+    userName: string,
+    sourceId: string,
+    bookId: string
+  ): Promise<void> {
+    await this.storage.deleteBookShelf(
+      userName,
+      generateStorageKey(sourceId, bookId)
+    );
+  }
+
+  // ---------- 电子书阅读历史 ----------
+  async getBookReadRecord(
+    userName: string,
+    sourceId: string,
+    bookId: string
+  ): Promise<BookReadRecord | null> {
+    return this.storage.getBookReadRecord(
+      userName,
+      generateStorageKey(sourceId, bookId)
+    );
+  }
+
+  async saveBookReadRecord(
+    userName: string,
+    sourceId: string,
+    bookId: string,
+    record: BookReadRecord
+  ): Promise<void> {
+    await this.storage.setBookReadRecord(
+      userName,
+      generateStorageKey(sourceId, bookId),
+      record
+    );
+  }
+
+  async getAllBookReadRecords(
+    userName: string
+  ): Promise<{ [key: string]: BookReadRecord }> {
+    return this.storage.getAllBookReadRecords(userName);
+  }
+
+  async deleteBookReadRecord(
+    userName: string,
+    sourceId: string,
+    bookId: string
+  ): Promise<void> {
+    await this.storage.deleteBookReadRecord(
+      userName,
+      generateStorageKey(sourceId, bookId)
+    );
+  }
+
   // 获取全部用户名
   async getAllUsers(): Promise<string[]> {
     if (typeof (this.storage as any).getAllUsers === 'function') {
@@ -400,6 +1041,28 @@ export class DbManager {
     if (typeof (this.storage as any).setAdminConfig === 'function') {
       await (this.storage as any).setAdminConfig(config);
     }
+  }
+
+  // ---------- 本地设置云同步 ----------
+  async getUserLocalSettings(
+    userName: string
+  ): Promise<LocalSettingsSyncRecord | null> {
+    if (typeof (this.storage as any).getUserLocalSettings === 'function') {
+      return (this.storage as any).getUserLocalSettings(userName);
+    }
+    return null;
+  }
+
+  async setUserLocalSettings(
+    userName: string,
+    payload: string,
+    opts: SetLocalSettingsSyncOptions
+  ): Promise<SetLocalSettingsSyncResult> {
+    if (typeof (this.storage as any).setUserLocalSettings === 'function') {
+      return (this.storage as any).setUserLocalSettings(userName, payload, opts);
+    }
+    // 存储后端不支持时静默忽略（等价于从未开启）
+    return { ok: true, version: 0, updatedAt: Date.now() };
   }
 
   // ---------- 跳过片头片尾配置 ----------
@@ -445,7 +1108,9 @@ export class DbManager {
   }
 
   // ---------- 弹幕过滤配置 ----------
-  async getDanmakuFilterConfig(userName: string): Promise<DanmakuFilterConfig | null> {
+  async getDanmakuFilterConfig(
+    userName: string
+  ): Promise<DanmakuFilterConfig | null> {
     if (typeof (this.storage as any).getDanmakuFilterConfig === 'function') {
       return (this.storage as any).getDanmakuFilterConfig(userName);
     }
@@ -493,6 +1158,59 @@ export class DbManager {
   async deleteGlobalValue(key: string): Promise<void> {
     if (typeof (this.storage as any).deleteGlobalValue === 'function') {
       await (this.storage as any).deleteGlobalValue(key);
+    }
+  }
+
+
+  // ---------- Telegram Bot绑定相关 ----------
+  async getTelegramBinding(userName: string) {
+    if (typeof (this.storage as any).getTelegramBinding === 'function') {
+      return (this.storage as any).getTelegramBinding(userName);
+    }
+    return null;
+  }
+
+  async getTelegramBindingByTelegramUserId(telegramUserId: string) {
+    if (typeof (this.storage as any).getTelegramBindingByTelegramUserId === 'function') {
+      return (this.storage as any).getTelegramBindingByTelegramUserId(telegramUserId);
+    }
+    return null;
+  }
+
+  async upsertTelegramBinding(binding: import('./types').TelegramBindingRecord): Promise<void> {
+    if (typeof (this.storage as any).upsertTelegramBinding === 'function') {
+      await (this.storage as any).upsertTelegramBinding(binding);
+    }
+  }
+
+  async deleteTelegramBindingByUsername(userName: string): Promise<void> {
+    if (typeof (this.storage as any).deleteTelegramBindingByUsername === 'function') {
+      await (this.storage as any).deleteTelegramBindingByUsername(userName);
+    }
+  }
+
+  async deleteTelegramBindingByTelegramUserId(telegramUserId: string): Promise<void> {
+    if (typeof (this.storage as any).deleteTelegramBindingByTelegramUserId === 'function') {
+      await (this.storage as any).deleteTelegramBindingByTelegramUserId(telegramUserId);
+    }
+  }
+
+  async getTelegramBindSession(code: string) {
+    if (typeof (this.storage as any).getTelegramBindSession === 'function') {
+      return (this.storage as any).getTelegramBindSession(code);
+    }
+    return null;
+  }
+
+  async upsertTelegramBindSession(session: import('./types').TelegramBindSessionRecord): Promise<void> {
+    if (typeof (this.storage as any).upsertTelegramBindSession === 'function') {
+      await (this.storage as any).upsertTelegramBindSession(session);
+    }
+  }
+
+  async markTelegramBindSessionUsed(code: string): Promise<void> {
+    if (typeof (this.storage as any).markTelegramBindSessionUsed === 'function') {
+      await (this.storage as any).markTelegramBindSessionUsed(code);
     }
   }
 }

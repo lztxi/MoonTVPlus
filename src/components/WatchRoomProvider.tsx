@@ -1,13 +1,27 @@
 // WatchRoom 全局状态管理 Provider
 'use client';
 
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { usePathname } from 'next/navigation';
+
 import { useWatchRoom } from '@/hooks/useWatchRoom';
-import type { Room, Member, ChatMessage, WatchRoomConfig } from '@/types/watch-room';
+
 import Toast, { ToastProps } from '@/components/Toast';
+
+import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
+
+import type { ChatMessage, Member, MusicSyncState, Room, RoomType, ScreenState, WatchRoomConfig } from '@/types/watch-room';
 
 // Import type from watch-room-socket
 type WatchRoomSocket = import('@/lib/watch-room-socket').WatchRoomSocket;
+const WATCH_ROOM_NO_CONNECT_KEY = 'watch_room_no_connect';
+const WATCH_ROOM_SCREEN_PATH = '/watch-room/screen';
+const WATCH_ROOM_NO_CONNECT_TIMESTAMP_KEY = 'watch_room_no_connect_timestamp';
+const WATCH_ROOM_NO_CONNECT_TTL_MS = 10 * 60 * 1000;
+
+function isTVPagePath(pathname: string | null) {
+  return pathname === '/tv' || Boolean(pathname?.startsWith('/tv/'));
+}
 
 interface WatchRoomContextType {
   socket: WatchRoomSocket | null;
@@ -26,12 +40,14 @@ interface WatchRoomContextType {
     description: string;
     password?: string;
     isPublic: boolean;
+    roomType: RoomType;
     userName: string;
   }) => Promise<Room>;
   joinRoom: (data: {
     roomId: string;
     password?: string;
     userName: string;
+    ownerToken?: string;
   }) => Promise<{ room: Room; members: Member[] }>;
   leaveRoom: () => void;
   getRoomList: () => Promise<Room[]>;
@@ -46,6 +62,14 @@ interface WatchRoomContextType {
   pause: () => void;
   changeVideo: (state: any) => void;
   changeLiveChannel: (state: any) => void;
+  startScreenShare: (state: ScreenState) => void;
+  stopScreenShare: () => void;
+  changeMusic: (state: MusicSyncState) => void;
+  updateMusicState: (state: MusicSyncState) => void;
+  updateMusicQueue: (state: MusicSyncState) => void;
+  playMusic: (state: MusicSyncState) => void;
+  pauseMusic: (state: MusicSyncState) => void;
+  seekMusic: (state: MusicSyncState) => void;
   clearRoomState: () => void;
 
   // 重连
@@ -72,10 +96,13 @@ interface WatchRoomProviderProps {
 }
 
 export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
+  const pathname = usePathname();
   const [config, setConfig] = useState<WatchRoomConfig | null>(null);
   const [isEnabled, setIsEnabled] = useState(false);
   const [toast, setToast] = useState<ToastProps | null>(null);
   const [reconnectFailed, setReconnectFailed] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [shouldDisableWatchRoomConnection, setShouldDisableWatchRoomConnection] = useState<boolean | null>(null);
 
   // 处理房间删除的回调
   const handleRoomDeleted = useCallback((data?: { reason?: string }) => {
@@ -113,6 +140,47 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
 
   const watchRoom = useWatchRoom(handleRoomDeleted, handleStateCleared);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const refreshWatchRoomConnectionState = () => {
+      const noConnect = window.localStorage.getItem(WATCH_ROOM_NO_CONNECT_KEY) === '1';
+      const lastActiveAt = Number(window.localStorage.getItem(WATCH_ROOM_NO_CONNECT_TIMESTAMP_KEY) || 0);
+      const isScreenPage = pathname === WATCH_ROOM_SCREEN_PATH;
+      const isTVPage = isTVPagePath(pathname);
+      const isExpired = !lastActiveAt || Date.now() - lastActiveAt > WATCH_ROOM_NO_CONNECT_TTL_MS;
+
+      if (noConnect && isExpired) {
+        window.localStorage.removeItem(WATCH_ROOM_NO_CONNECT_KEY);
+        window.localStorage.removeItem(WATCH_ROOM_NO_CONNECT_TIMESTAMP_KEY);
+      }
+
+      setShouldDisableWatchRoomConnection(isTVPage || (!isScreenPage && noConnect && !isExpired));
+    };
+
+    refreshWatchRoomConnectionState();
+    const interval = window.setInterval(refreshWatchRoomConnectionState, 30_000);
+
+    return () => window.clearInterval(interval);
+  }, [pathname]);
+
+  // 检查登录状态
+  useEffect(() => {
+    const checkLoginStatus = () => {
+      const authInfo = getAuthInfoFromBrowserCookie();
+      const loggedIn = !!(authInfo && authInfo.username);
+      setIsLoggedIn(loggedIn);
+    };
+
+    // 初始检查
+    checkLoginStatus();
+
+    // 定期检查登录状态（每秒检查一次）
+    const interval = setInterval(checkLoginStatus, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
   // 手动重连
   const manualReconnect = useCallback(async () => {
     console.log('[WatchRoomProvider] Manual reconnect initiated');
@@ -133,6 +201,7 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
             roomId: info.roomId,
             password: info.password,
             userName: info.userName,
+            ownerToken: info.ownerToken,
           });
         } catch (error) {
           console.error('[WatchRoomProvider] Failed to rejoin room after reconnect:', error);
@@ -146,6 +215,20 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
 
   // 加载配置
   useEffect(() => {
+    if (shouldDisableWatchRoomConnection === null) {
+      return;
+    }
+
+    if (shouldDisableWatchRoomConnection) {
+      watchRoom.disconnect();
+      setConfig({
+        enabled: false,
+        serverType: 'internal',
+      });
+      setIsEnabled(false);
+      return;
+    }
+
     const loadConfig = async () => {
       try {
         // 使用公共 API 获取观影室配置（不需要管理员权限）
@@ -161,20 +244,26 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
 
           // 如果使用外部服务器，需要获取认证信息（需要登录）
           if (watchRoomConfig.serverType === 'external' && watchRoomConfig.enabled) {
-            try {
-              const authResponse = await fetch('/api/watch-room-auth');
-              if (authResponse.ok) {
-                const authData = await authResponse.json();
-                watchRoomConfig.externalServerAuth = authData.externalServerAuth;
-              } else {
-                console.error('[WatchRoom] Failed to load auth info:', authResponse.status);
+            // 检查用户是否已登录
+            if (!isLoggedIn) {
+              console.log('[WatchRoom] User not logged in, skipping auth info request');
+              // 用户未登录，不调用认证接口
+            } else {
+              try {
+                const authResponse = await fetch('/api/watch-room-auth');
+                if (authResponse.ok) {
+                  const authData = await authResponse.json();
+                  watchRoomConfig.externalServerAuth = authData.externalServerAuth;
+                } else {
+                  console.error('[WatchRoom] Failed to load auth info:', authResponse.status);
+                  // 如果无法获取认证信息，禁用观影室
+                  watchRoomConfig.enabled = false;
+                }
+              } catch (error) {
+                console.error('[WatchRoom] Error loading auth info:', error);
                 // 如果无法获取认证信息，禁用观影室
                 watchRoomConfig.enabled = false;
               }
-            } catch (error) {
-              console.error('[WatchRoom] Error loading auth info:', error);
-              // 如果无法获取认证信息，禁用观影室
-              watchRoomConfig.enabled = false;
             }
           }
 
@@ -224,8 +313,10 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
     };
 
     loadConfig();
+  }, [isLoggedIn, shouldDisableWatchRoomConnection]); // 添加 isLoggedIn 作为依赖
 
-    // 清理
+  // 仅在 Provider 卸载时断开，避免路由切换时误断开房间连接
+  useEffect(() => {
     return () => {
       watchRoom.disconnect();
     };
@@ -252,6 +343,14 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
     pause: watchRoom.pause,
     changeVideo: watchRoom.changeVideo,
     changeLiveChannel: watchRoom.changeLiveChannel,
+    startScreenShare: watchRoom.startScreenShare,
+    stopScreenShare: watchRoom.stopScreenShare,
+    changeMusic: watchRoom.changeMusic,
+    updateMusicState: watchRoom.updateMusicState,
+    updateMusicQueue: watchRoom.updateMusicQueue,
+    playMusic: watchRoom.playMusic,
+    pauseMusic: watchRoom.pauseMusic,
+    seekMusic: watchRoom.seekMusic,
     clearRoomState: watchRoom.clearRoomState,
     manualReconnect,
   };

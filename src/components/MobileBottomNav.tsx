@@ -2,7 +2,7 @@
 
 'use client';
 
-import { Cat, Clover, Film, FolderOpen, Home, Radio, Star, Tv, Users } from 'lucide-react';
+import { Blend, Cat, Clover, Container, Film, Globe, Home, Star, Tv, TvMinimalPlay, Users } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useSearchParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
@@ -28,6 +28,10 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
   };
   const currentActive = activePath ?? getCurrentFullPath();
 
+  if (pathname === '/watch-room/screen') {
+    return null;
+  }
+
   const [navItems, setNavItems] = useState([
     { icon: Home, label: '首页', href: '/' },
     {
@@ -50,18 +54,18 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
       label: '综艺',
       href: '/douban?type=show',
     },
-    {
-      icon: Radio,
-      label: '直播',
-      href: '/live',
-    },
+      {
+        icon: TvMinimalPlay,
+        label: '电视直播',
+        href: '/live',
+      },
   ]);
 
   useEffect(() => {
     const runtimeConfig = (window as any).RUNTIME_CONFIG;
 
     // 基础导航项（不包括观影室）
-    let items = [
+    const items = [
       { icon: Home, label: '首页', href: '/' },
       {
         icon: Film,
@@ -83,19 +87,40 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
         label: '综艺',
         href: '/douban?type=show',
       },
-      {
-        icon: Radio,
-        label: '直播',
-        href: '/live',
-      },
+      ...(runtimeConfig?.LIVE_ENABLED
+        ? [
+            {
+              icon: TvMinimalPlay,
+              label: '电视直播',
+              href: '/live',
+            },
+          ]
+        : []),
     ];
 
-    // 如果配置了 OpenList，添加私人影库入口
-    if (runtimeConfig?.OPENLIST_ENABLED) {
+    // 如果启用网络直播，添加网络直播入口
+    if (runtimeConfig?.WEB_LIVE_ENABLED) {
       items.push({
-        icon: FolderOpen,
+        icon: Globe,
+        label: '网络直播',
+        href: '/web-live',
+      });
+    }
+
+    // 如果配置了 OpenList 或 Emby，添加私人影库入口
+    if (runtimeConfig?.PRIVATE_LIBRARY_ENABLED) {
+      items.push({
+        icon: Container,
         label: '私人影库',
         href: '/private-library',
+      });
+    }
+
+    if (runtimeConfig?.ADVANCED_RECOMMENDATION_ENABLED) {
+      items.push({
+        icon: Blend,
+        label: '高级推荐',
+        href: '/advanced-recommendation',
       });
     }
 

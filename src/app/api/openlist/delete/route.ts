@@ -4,9 +4,9 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
+import { requireFeaturePermission } from '@/lib/permissions';
 import { db } from '@/lib/db';
 import {
-  getCachedMetaInfo,
   invalidateMetaInfoCache,
   MetaInfo,
   setCachedMetaInfo,
@@ -20,6 +20,8 @@ export const runtime = 'nodejs';
  */
 export async function POST(request: NextRequest) {
   try {
+    const authResult = await requireFeaturePermission(request, 'private_library', '无权限访问私人影库');
+    if (authResult instanceof NextResponse) return authResult;
     // 权限检查
     const authInfo = getAuthInfoFromCookie(request);
     if (!authInfo || !authInfo.username) {
@@ -49,8 +51,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const rootPath = openListConfig.RootPath || '/';
-
     // 从数据库读取 metainfo
     const metainfoContent = await db.getGlobalValue('video.metainfo');
     if (!metainfoContent) {
@@ -78,8 +78,8 @@ export async function POST(request: NextRequest) {
     await db.setGlobalValue('video.metainfo', updatedMetainfoContent);
 
     // 更新缓存
-    invalidateMetaInfoCache(rootPath);
-    setCachedMetaInfo(rootPath, metaInfo);
+    invalidateMetaInfoCache();
+    setCachedMetaInfo(metaInfo);
 
     // 更新配置中的资源数量
     if (config.OpenListConfig) {
